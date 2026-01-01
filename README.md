@@ -151,6 +151,11 @@ SQLite met o.a.:
 - CPU temperatuur
 - Best-effort detectie
 - Geen crash bij ontbrekende hardware
+- Pin conector aanlsuitinten 6pins.
+- Groen    -  4    VCC
+- Groen Wit - 5    GND
+- Oranje  - 1      
+- Oranje wit 2
 
 ---
 
