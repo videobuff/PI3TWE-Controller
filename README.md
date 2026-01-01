@@ -1,5 +1,3 @@
-# PI3TWE-Controller
-
 # PI3TWE Controller & TFT-integratie  
 **Projectarchief – Raspberry Pi 3**
 
