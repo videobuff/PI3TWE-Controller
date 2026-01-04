@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+
+# Secrets & runtime
+secrets/
+*.key
+*.db
+*.sqlite*
+*.log
+
+# System / editor
+.DS_Store
+*.swp
+*.bak
+
+# State / runtime dirs
+/var/

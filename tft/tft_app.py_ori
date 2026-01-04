@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+# =============================================================================
+# File: /srv/pi3twe/app/tft/tft_app_fb.py
+# Generated: 2025-12-30 (Europe/Amsterdam)
+# Description:
+#   PI3TWE TFT UI (framebuffer RGB565, NO SDL/pygame).
+#   - Draws to /dev/fbX (RGB565) at 480x320 (SPI fbdev)
+#   - Touch via /dev/input/eventX (ADS7846)  [optional]
+#   - Backend:
+#       GET  /api/tft/state
+#       POST /api/tft/toggle
+#       POST /api/tft/reboot
+#
+# Key improvement:
+#   SPI fbdev has no vsync. Full-screen rewrites cause tearing/flicker.
+#   Therefore we do "dirty rectangle" updates:
+#     - Only update the parts that changed (time, cooldown, button, rows).
+#
+# Changes (requested):
+#   - Touch can be disabled cleanly (PI3TWE_TOUCH_DEV empty/none/off/0).
+#   - Touch polling is skipped when disabled (no select()/read() on None).
+#   - Click log now includes tap duration in seconds (dt=...s).
+#   - Fixed indentation issues introduced by earlier edits.
+# =============================================================================
+
+from __future__ import annotations
+
+import os
+import time
+import json
+import mmap
+import fcntl
+import struct
+import signal
+import select
+import urllib.request
+import urllib.error
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Tuple, List
+
+from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+
+# ------------------------------ Config --------------------------------------
+
+FB = os.environ.get("PI3TWE_FB", "/dev/fb1")
+
+# Touch device:
+# - Default is EMPTY (disabled), so the two “touch fields” are effectively blank unless you set them.
+# - Enable by setting: PI3TWE_TOUCH_DEV=/dev/input/eventX
+TOUCH_DEV = os.environ.get("PI3TWE_TOUCH_DEV", "")
+
+BACKEND_BASE = os.environ.get("PI3TWE_BACKEND", "http://127.0.0.1:3000")
+TOKEN_FILE = os.environ.get("PI3TWE_TFT_TOKEN_FILE", "/srv/pi3twe/app/secrets/tft_token.txt")
+
+W = int(os.environ.get("PI3TWE_W", "480"))
+H = int(os.environ.get("PI3TWE_H", "320"))
+
+REFRESH_S = float(os.environ.get("PI3TWE_TFT_REFRESH", "1.0"))
+HEARTBEAT_S = float(os.environ.get("PI3TWE_HEARTBEAT_S", "10.0"))
+
+# Touch calibration (raw -> pixel)
+RAW_X_MIN = int(os.environ.get("PI3TWE_RAW_X_MIN", "250"))
+RAW_X_MAX = int(os.environ.get("PI3TWE_RAW_X_MAX", "3900"))
+RAW_Y_MIN = int(os.environ.get("PI3TWE_RAW_Y_MIN", "250"))
+RAW_Y_MAX = int(os.environ.get("PI3TWE_RAW_Y_MAX", "3900"))
+
+TOUCH_SWAP_XY = os.environ.get("PI3TWE_TOUCH_SWAP_XY", "0") == "1"
+TOUCH_INVERT_X = os.environ.get("PI3TWE_TOUCH_INVERT_X", "0") == "1"
+TOUCH_INVERT_Y = os.environ.get("PI3TWE_TOUCH_INVERT_Y", "1") == "1"  # your current working default
+
+# Touch click behavior
+TOUCH_MAX_TAP_S = float(os.environ.get("PI3TWE_TOUCH_MAX_TAP_S", "1.2"))
+TOUCH_MOVE_SLOP = int(os.environ.get("PI3TWE_TOUCH_MOVE_SLOP", "80"))
+TOUCH_DEBOUNCE_S = float(os.environ.get("PI3TWE_TOUCH_DEBOUNCE_S", "0.25"))
+TOUCH_HIT_SLOP = int(os.environ.get("PI3TWE_TOUCH_HIT_SLOP", "60"))
+
+# Layout
+PAD = 18
+HEADER_Y = 12
+
+ROW_Y0 = 84
+ROW_GAP = 34
+
+COL_LABEL_X = PAD
+COL_COLON_X = PAD + 150
+COL_VAL1_X = PAD + 175
+COL_VAL2_X = PAD + 330
+
+BTN_H = 74
+BTN_Y = H - PAD - BTN_H
+BTN_GAP = 18
+BTN_W = (W - 2 * PAD - BTN_GAP) // 2
+
+BTN1 = (PAD, BTN_Y, PAD + BTN_W, BTN_Y + BTN_H)  # Repeater
+BTN2 = (PAD + BTN_W + BTN_GAP, BTN_Y, PAD + 2 * BTN_W + BTN_GAP, BTN_Y + BTN_H)  # Reboot
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+YELLOW = (255, 210, 0)
+GREEN_ON = (0, 150, 0)
+BLUE_OFF = (0, 90, 200)
+ORANGE = (255, 140, 0)
+DIM = (180, 180, 180)
+
+# Fonts
+FONT_REG = os.environ.get("PI3TWE_FONT_REG", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+FONT_BOLD = os.environ.get("PI3TWE_FONT_BOLD", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+
+
+# ------------------------------ Logging -------------------------------------
+
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pid = os.getpid()
+    print(f"{ts} TFT pid={pid} {msg}", flush=True)
+
+
+# ------------------------------ Utilities -----------------------------------
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def load_token() -> str:
+    try:
+        return _read_text(TOKEN_FILE)
+    except Exception:
+        return ""
+
+
+def http_get_json(url: str, headers: dict, timeout: float = 2.0) -> Optional[dict]:
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = r.read().decode("utf-8", errors="replace")
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def http_post(url: str, headers: dict, timeout: float = 2.0) -> Tuple[bool, str]:
+    try:
+        req = urllib.request.Request(url, method="POST", headers=headers, data=b"")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            payload = r.read().decode("utf-8", errors="replace").strip()
+        if payload:
+            try:
+                j = json.loads(payload)
+                if isinstance(j, dict) and j.get("ok") is True:
+                    return True, "ok"
+                if isinstance(j, dict) and j.get("ok") is False:
+                    em = (j.get("error") or {}).get("message", "error")
+                    return False, em
+            except Exception:
+                pass
+        return True, "ok"
+    except urllib.error.HTTPError as e:
+        try:
+            p = e.read().decode("utf-8", errors="replace")
+            j = json.loads(p)
+            em = (j.get("error") or {}).get("message", str(e))
+            return False, em
+        except Exception:
+            return False, str(e)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    return lo if v < lo else hi if v > hi else v
+
+
+def map_value(v: int, vmin: int, vmax: int, out_min: int, out_max: int) -> int:
+    v = clamp(v, vmin, vmax)
+    if vmax == vmin:
+        return out_min
+    return int((v - vmin) * (out_max - out_min) / (vmax - vmin) + out_min)
+
+
+def fmt_1(v: object, suffix: str = "") -> str:
+    try:
+        if v is None:
+            return "--.-" + suffix
+        return f"{float(v):.1f}{suffix}"
+    except Exception:
+        return "--.-" + suffix
+
+
+def hhmm_from_state(state: dict) -> str:
+    t = (state or {}).get("time") or ""
+    if isinstance(t, str) and len(t) >= 16:
+        return t[11:16]
+    return datetime.now().strftime("%H:%M")
+
+
+def pick_font(path: str, size: int) -> ImageFont.ImageFont:
+    try:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size=size)
+    except Exception:
+        pass
+    return ImageFont.load_default()
+
+
+# ------------------------------ Framebuffer ---------------------------------
+
+FBIOGET_VSCREENINFO = 0x4600
+FBIOGET_FSCREENINFO = 0x4602
+
+
+def _ioctl_bytes(fd: int, req: int, n: int) -> bytes:
+    buf = bytearray(n)
+    out = fcntl.ioctl(fd, req, buf, True)
+    return bytes(out) if isinstance(out, (bytes, bytearray)) else bytes(buf)
+
+
+def _get_fb_index(path: str) -> Optional[int]:
+    base = os.path.basename(path)
+    if base.startswith("fb"):
+        try:
+            return int(base[2:])
+        except Exception:
+            return None
+    return None
+
+
+def _sysfs_int(path: str) -> Optional[int]:
+    try:
+        return int(_read_text(path))
+    except Exception:
+        return None
+
+
+def _sysfs_tuple(path: str) -> Optional[Tuple[int, int]]:
+    try:
+        s = _read_text(path)
+        if "," in s:
+            a, b = s.split(",", 1)
+            return int(a), int(b)
+    except Exception:
+        pass
+    return None
+
+
+class Framebuffer:
+    def __init__(self, fb_path: str):
+        self.path = fb_path
+        self.fd = os.open(self.path, os.O_RDWR)
+
+        xres = yres = bpp = line_len = smem_len = None
+        try:
+            v = _ioctl_bytes(self.fd, FBIOGET_VSCREENINFO, 256)
+            xres, yres = struct.unpack_from("II", v, 0)
+            bpp = struct.unpack_from("I", v, 24)[0]
+
+            f = _ioctl_bytes(self.fd, FBIOGET_FSCREENINFO, 256)
+            smem_len = struct.unpack_from("I", f, 24)[0]
+            line_len = struct.unpack_from("I", f, 44)[0]
+        except Exception:
+            pass
+
+        fb_idx = _get_fb_index(self.path) or 0
+        sysbase = f"/sys/class/graphics/fb{fb_idx}"
+        if xres is None or yres is None:
+            vt = _sysfs_tuple(f"{sysbase}/virtual_size")
+            if vt:
+                xres, yres = vt
+        if bpp is None:
+            bpp = _sysfs_int(f"{sysbase}/bits_per_pixel")
+        if line_len is None or int(line_len or 0) == 0:
+            stride = _sysfs_int(f"{sysbase}/stride")
+            if stride:
+                line_len = stride
+
+        self.w = int(xres) if xres else W
+        self.h = int(yres) if yres else H
+        self.bpp = int(bpp) if bpp else 16
+        if self.bpp != 16:
+            raise RuntimeError(f"Unsupported fb bpp={self.bpp}, expected 16 (RGB565)")
+
+        self.line_length = int(line_len) if line_len and int(line_len) > 0 else self.w * 2
+        self.smem_len = int(smem_len) if smem_len and int(smem_len) > 0 else self.line_length * self.h
+        self.size = self.smem_len
+
+        self.mm = mmap.mmap(self.fd, self.size, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+
+        log(
+            f"FB open path={self.path} xres={self.w} yres={self.h} bpp={self.bpp} "
+            f"line_length={self.line_length} smem_len={self.smem_len} mmap_size={self.size}"
+        )
+
+    def close(self):
+        try:
+            self.mm.close()
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
+
+    def blit_rect_rgb565(self, x: int, y: int, w: int, h: int, rgb565: bytes):
+        """
+        Write a rectangle at (x,y) with size w*h to the framebuffer.
+        rgb565 must be w*h*2 bytes, little-endian RGB565, row-major.
+        """
+        if w <= 0 or h <= 0:
+            return
+        x = clamp(x, 0, self.w - 1)
+        y = clamp(y, 0, self.h - 1)
+        w = min(w, self.w - x)
+        h = min(h, self.h - y)
+
+        expected = w * h * 2
+        if len(rgb565) != expected:
+            raise ValueError(f"rect rgb565 length {len(rgb565)} != {expected}")
+
+        row_bytes = w * 2
+        for row in range(h):
+            fb_off = (y + row) * self.line_length + (x * 2)
+            src_off = row * row_bytes
+            self.mm.seek(fb_off)
+            self.mm.write(rgb565[src_off:src_off + row_bytes])
+
+
+def image_to_rgb565(im: Image.Image) -> bytes:
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    raw = im.tobytes()
+    out = bytearray(im.size[0] * im.size[1] * 2)
+    j = 0
+    for i in range(0, len(raw), 3):
+        r = raw[i]
+        g = raw[i + 1]
+        b = raw[i + 2]
+        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out[j] = v & 0xFF
+        out[j + 1] = (v >> 8) & 0xFF
+        j += 2
+    return bytes(out)
+
+
+def subimage_to_rgb565(base: Image.Image, rect: Tuple[int, int, int, int]) -> Tuple[int, int, int, int, bytes]:
+    """
+    rect is (x1,y1,x2,y2) in pixel coords.
+    Returns x,y,w,h,rgb565bytes for that cropped region.
+    """
+    x1, y1, x2, y2 = rect
+    x1 = clamp(x1, 0, W)
+    y1 = clamp(y1, 0, H)
+    x2 = clamp(x2, 0, W)
+    y2 = clamp(y2, 0, H)
+    if x2 <= x1 or y2 <= y1:
+        return 0, 0, 0, 0, b""
+    crop = base.crop((x1, y1, x2, y2))
+    rgb565 = image_to_rgb565(crop)
+    return x1, y1, (x2 - x1), (y2 - y1), rgb565
+
+
+# ------------------------------ Touch input ---------------------------------
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+
+ABS_X = 0x00
+ABS_Y = 0x01
+ABS_PRESSURE = 0x18
+BTN_TOUCH = 330
+
+SYN_REPORT = 0
+
+INPUT_EVENT_STRUCT = struct.Struct("qqHHi")  # 24 bytes (64-bit)
+
+
+@dataclass
+class TouchSample:
+    raw_x: int = 0
+    raw_y: int = 0
+    pressure: int = 0
+    btn: int = 0
+    have_x: bool = False
+    have_y: bool = False
+
+
+def map_touch(raw_x: int, raw_y: int) -> Tuple[int, int]:
+    rx, ry = raw_x, raw_y
+    if TOUCH_SWAP_XY:
+        rx, ry = ry, rx
+
+    px = map_value(rx, RAW_X_MIN, RAW_X_MAX, 0, W - 1)
+    py = map_value(ry, RAW_Y_MIN, RAW_Y_MAX, 0, H - 1)
+
+    if TOUCH_INVERT_X:
+        px = (W - 1) - px
+    if TOUCH_INVERT_Y:
+        py = (H - 1) - py
+    return px, py
+
+
+def in_rect(x: int, y: int, r: Tuple[int, int, int, int], slop: int = 0) -> bool:
+    x1, y1, x2, y2 = r
+    return (x1 - slop) <= x <= (x2 + slop) and (y1 - slop) <= y <= (y2 + slop)
+
+
+# ------------------------------ UI drawing ----------------------------------
+
+# Predefined dirty regions (approx bounding boxes)
+# We keep them slightly padded to avoid glyph remnants.
+REG_TIME = (W - PAD - 120, HEADER_Y - 4, W - PAD + 4, HEADER_Y + 44)
+REG_WAN = (PAD - 2, HEADER_Y + 36, W - PAD + 2, HEADER_Y + 62)
+
+REG_ROW_INT = (0, ROW_Y0 - 6, W, ROW_Y0 - 6 + 30)
+REG_ROW_EXT = (0, ROW_Y0 + ROW_GAP - 6, W, ROW_Y0 + ROW_GAP - 6 + 30)
+REG_ROW_CPU = (0, ROW_Y0 + 2 * ROW_GAP - 6, W, ROW_Y0 + 2 * ROW_GAP - 6 + 30)
+REG_ROW_CD = (0, ROW_Y0 + 3 * ROW_GAP - 6, W, ROW_Y0 + 3 * ROW_GAP - 6 + 30)
+
+REG_BTN1 = (BTN1[0] - 2, BTN1[1] - 2, BTN1[2] + 2, BTN1[3] + 2)
+REG_BTN2 = (BTN2[0] - 2, BTN2[1] - 2, BTN2[2] + 2, BTN2[3] + 2)
+
+
+def draw_button(draw: ImageDraw.ImageDraw, rect, fill_rgb, text, font, text_rgb=WHITE):
+    x1, y1, x2, y2 = rect
+    draw.rounded_rectangle([x1, y1, x2, y2], radius=14, fill=fill_rgb, outline=WHITE, width=2)
+    bb = draw.textbbox((0, 0), text, font=font)
+    tw = bb[2] - bb[0]
+    th = bb[3] - bb[1]
+    cx = x1 + (x2 - x1 - tw) // 2
+    cy = y1 + (y2 - y1 - th) // 2 - 1
+    draw.text((cx, cy), text, font=font, fill=text_rgb)
+
+
+def draw_row(draw: ImageDraw.ImageDraw, y: int, label: str, v1: str, v2: Optional[str], font):
+    draw.text((COL_LABEL_X, y), label, font=font, fill=WHITE)
+    draw.text((COL_COLON_X, y), ":", font=font, fill=WHITE)
+    draw.text((COL_VAL1_X, y), v1, font=font, fill=WHITE)
+    if v2 is not None:
+        draw.text((COL_VAL2_X, y), v2, font=font, fill=WHITE)
+
+
+def build_screen(state: dict) -> Image.Image:
+    im = Image.new("RGB", (W, H), BLACK)
+    draw = ImageDraw.Draw(im)
+
+    font_h = pick_font(FONT_BOLD, 32)
+    font_r = pick_font(FONT_BOLD, 24)
+    font_small = pick_font(FONT_REG, 18)
+    font_btn = pick_font(FONT_BOLD, 28)
+
+    draw.text((PAD, HEADER_Y), "PI3TWE STATUS", font=font_h, fill=WHITE)
+
+    tm = hhmm_from_state(state)
+    bb = draw.textbbox((0, 0), tm, font=font_h)
+    tm_w = bb[2] - bb[0]
+    draw.text((W - PAD - tm_w, HEADER_Y), tm, font=font_h, fill=WHITE)
+
+    wan = (state or {}).get("ip_external") or "-"
+    draw.text((PAD, HEADER_Y + 40), f"WAN: {wan}", font=font_small, fill=YELLOW)
+
+    repeater_on = bool((state or {}).get("repeater", False))
+    cooldown = int((state or {}).get("cooldown", 0) or 0)
+
+    temp_int = (state or {}).get("temp_int_c", None)
+    hum_int = (state or {}).get("hum_int_pct", None)
+    temp_ext = (state or {}).get("temp_ext_c", None)
+    hum_ext = (state or {}).get("hum_ext_pct", None)
+    cpu_c = (state or {}).get("cpu_temp_c", None)
+
+    y = ROW_Y0
+    draw_row(draw, y, "INT TEMP", f"{fmt_1(temp_int, ' C')}", f"{fmt_1(hum_int, ' %')}", font_r)
+    y += ROW_GAP
+    draw_row(draw, y, "EXT TEMP", f"{fmt_1(temp_ext, ' C')}", f"{fmt_1(hum_ext, ' %')}", font_r)
+    y += ROW_GAP
+    draw_row(draw, y, "CPU TEMP", f"{fmt_1(cpu_c, ' C')}", None, font_r)
+    y += ROW_GAP
+
+    cd_color = YELLOW if cooldown > 0 else DIM
+    draw.text((COL_LABEL_X, y), "COOLDOWN", font=font_r, fill=WHITE)
+    draw.text((COL_COLON_X, y), ":", font=font_r, fill=WHITE)
+    draw.text((COL_VAL1_X, y), f"{cooldown:02d} s", font=font_r, fill=cd_color)
+
+    rpt_fill = GREEN_ON if repeater_on else BLUE_OFF
+    rpt_text = "RPT=ON" if repeater_on else "RPT=OFF"
+    draw_button(draw, BTN1, rpt_fill, rpt_text, font_btn, WHITE)
+    draw_button(draw, BTN2, ORANGE, "REBOOT", font_btn, WHITE)
+
+    return im
+
+
+# ------------------------------ Main loop -----------------------------------
+
+RUN = True
+
+
+def _sigterm(_signo, _frame):
+    global RUN
+    RUN = False
+
+
+signal.signal(signal.SIGINT, _sigterm)
+signal.signal(signal.SIGTERM, _sigterm)
+
+
+def _touch_disabled(dev: object) -> bool:
+    s = str(dev).strip().lower()
+    return (not s) or (s in ("none", "off", "0"))
+
+
+def main() -> int:
+    token = load_token()
+    if not token:
+        log(f"ERROR: no TFT token found in {TOKEN_FILE}")
+        return 2
+
+    headers = {
+        "X-TFT-Token": token,
+        "User-Agent": "pi3twe-tft/1.0",
+    }
+
+    log(
+        "START "
+        f"fb={FB} touch={TOUCH_DEV} backend={BACKEND_BASE} token_file={TOKEN_FILE} "
+        f"W={W} H={H} refresh={REFRESH_S}s hb={HEARTBEAT_S}s "
+        f"touch_cal=[{RAW_X_MIN}..{RAW_X_MAX}]x[{RAW_Y_MIN}..{RAW_Y_MAX}] "
+        f"swapxy={int(TOUCH_SWAP_XY)} invx={int(TOUCH_INVERT_X)} invy={int(TOUCH_INVERT_Y)} "
+        f"tap={TOUCH_MAX_TAP_S}s slop={TOUCH_MOVE_SLOP}px debounce={TOUCH_DEBOUNCE_S}s hit_slop={TOUCH_HIT_SLOP}px "
+        f"mode=dirty-rect"
+    )
+
+    fb = Framebuffer(FB)
+
+    tfd: Optional[int]
+    if _touch_disabled(TOUCH_DEV):
+        tfd = None
+        log("TOUCH disabled")
+    else:
+        tfd = os.open(str(TOUCH_DEV), os.O_RDONLY | os.O_NONBLOCK)
+        log(f"TOUCH open ok dev={TOUCH_DEV}")
+
+    state: dict = {}
+    last_fetch = 0.0
+    last_hb = 0.0
+    frames = 0
+
+    # touch / click
+    ts = TouchSample()
+    pressed = False
+    down_xy = (0, 0)
+    down_t = 0.0
+    last_action_t = 0.0
+
+    touch_events = 0
+    last_touch_log = 0.0
+    last_raw = (0, 0)
+    touch_down = False
+
+    # rendering state
+    last_img: Optional[Image.Image] = None
+    last_time_hhmm: Optional[str] = None
+
+    # Keep last values to decide dirty regions
+    last_ip: Optional[str] = None
+    last_rep: Optional[bool] = None
+    last_cd: Optional[int] = None
+    last_int: Tuple[object, object] = (None, None)
+    last_ext: Tuple[object, object] = (None, None)
+    last_cpu: object = None
+
+    def full_redraw(reason: str) -> None:
+        nonlocal last_img, frames
+        img = build_screen(state)
+        x, y, w, h, b = subimage_to_rgb565(img, (0, 0, W, H))
+        fb.blit_rect_rgb565(x, y, w, h, b)
+        last_img = img
+        frames += 1
+        log(f"RENDER full reason={reason} frames={frames}")
+
+    def dirty_redraw(regions: List[Tuple[int, int, int, int]], reason: str) -> None:
+        nonlocal last_img, frames
+        if last_img is None:
+            full_redraw("init")
+            return
+        img = build_screen(state)
+        for rr in regions:
+            x, y, w, h, b = subimage_to_rgb565(img, rr)
+            if w > 0 and h > 0:
+                fb.blit_rect_rgb565(x, y, w, h, b)
+        last_img = img
+        frames += 1
+        # keep log lightweight
+        # log(f"RENDER dirty n={len(regions)} reason={reason} frames={frames}")
+
+    try:
+        # initial fetch + full draw
+        st = http_get_json(f"{BACKEND_BASE}/api/tft/state", headers=headers, timeout=2.0)
+        if isinstance(st, dict):
+            state = st
+        full_redraw("startup")
+
+        while RUN:
+            now = time.time()
+
+            # ---- Touch poll (only if enabled) ----
+            if tfd is not None:
+                r, _, _ = select.select([tfd], [], [], 0.02)
+                if tfd in r:
+                    data = os.read(tfd, INPUT_EVENT_STRUCT.size * 64)
+                    for off in range(0, len(data), INPUT_EVENT_STRUCT.size):
+                        chunk = data[off:off + INPUT_EVENT_STRUCT.size]
+                        if len(chunk) != INPUT_EVENT_STRUCT.size:
+                            continue
+                        _sec, _usec, etype, code, value = INPUT_EVENT_STRUCT.unpack(chunk)
+                        touch_events += 1
+
+                        if etype == EV_KEY and code == BTN_TOUCH:
+                            ts.btn = int(value)
+                        elif etype == EV_ABS:
+                            if code == ABS_X:
+                                ts.raw_x = int(value)
+                                ts.have_x = True
+                            elif code == ABS_Y:
+                                ts.raw_y = int(value)
+                                ts.have_y = True
+                            elif code == ABS_PRESSURE:
+                                ts.pressure = int(value)
+                        elif etype == EV_SYN and code == SYN_REPORT:
+                            is_down = (ts.btn == 1) or (ts.pressure > 0)
+
+                            if ts.have_x and ts.have_y:
+                                px, py = map_touch(ts.raw_x, ts.raw_y)
+                                last_raw = (ts.raw_x, ts.raw_y)
+                            else:
+                                px, py = down_xy
+
+                            if now - last_touch_log >= 4.0:
+                                log(f"TOUCH activity events={touch_events} last_raw={last_raw} btn={ts.btn} p={ts.pressure}")
+                                touch_events = 0
+                                last_touch_log = now
+
+                            # Hard block of rendering while touch is down (prevents bus fights)
+                            touch_down = is_down
+
+                            # Click detection
+                            if is_down and not pressed:
+                                pressed = True
+                                down_xy = (px, py)
+                                down_t = now
+
+                            if (not is_down) and pressed:
+                                pressed = False
+                                up_xy = (px, py)
+
+                                dt = now - down_t
+                                dx = abs(up_xy[0] - down_xy[0])
+                                dy = abs(up_xy[1] - down_xy[1])
+
+                                if dt <= TOUCH_MAX_TAP_S and dx <= TOUCH_MOVE_SLOP and dy <= TOUCH_MOVE_SLOP:
+                                    if (now - last_action_t) >= TOUCH_DEBOUNCE_S:
+                                        last_action_t = now
+                                        x, y = down_xy
+
+                                        if in_rect(x, y, BTN1, slop=TOUCH_HIT_SLOP):
+                                            ok, em = http_post(f"{BACKEND_BASE}/api/tft/toggle", headers=headers, timeout=2.0)
+                                            log(
+                                                f"TOUCH click dt={dt:.3f}s x={x} y={y} target=BTN1(RPT) "
+                                                f"raw={last_raw} -> API toggle ok={ok} msg={em}"
+                                            )
+                                            last_fetch = 0.0  # force refresh
+                                        elif in_rect(x, y, BTN2, slop=TOUCH_HIT_SLOP):
+                                            ok, em = http_post(f"{BACKEND_BASE}/api/tft/reboot", headers=headers, timeout=2.0)
+                                            log(
+                                                f"TOUCH click dt={dt:.3f}s x={x} y={y} target=BTN2(REBOOT) "
+                                                f"raw={last_raw} -> API reboot ok={ok} msg={em}"
+                                            )
+                                            last_fetch = 0.0
+                                        else:
+                                            log(f"TOUCH click dt={dt:.3f}s x={x} y={y} target=NONE raw={last_raw}")
+
+                                ts.have_x = False
+                                ts.have_y = False
+
+            # ---- Fetch state ----
+            if (now - last_fetch) >= REFRESH_S:
+                st = http_get_json(f"{BACKEND_BASE}/api/tft/state", headers=headers, timeout=2.0)
+                if isinstance(st, dict):
+                    state = st
+                last_fetch = now
+
+                # Determine what changed => dirty regions
+                regions: List[Tuple[int, int, int, int]] = []
+
+                # time HH:MM only (once per minute)
+                hhmm = hhmm_from_state(state)
+                if last_time_hhmm != hhmm:
+                    regions.append(REG_TIME)
+                    last_time_hhmm = hhmm
+
+                ip = str((state or {}).get("ip_external") or "-")
+                if last_ip != ip:
+                    regions.append(REG_WAN)
+                    last_ip = ip
+
+                rep = bool((state or {}).get("repeater", False))
+                if last_rep is None or last_rep != rep:
+                    regions.append(REG_BTN1)
+                    last_rep = rep
+
+                cd = int((state or {}).get("cooldown", 0) or 0)
+                if last_cd is None or last_cd != cd:
+                    regions.append(REG_ROW_CD)
+                    last_cd = cd
+
+                t_int = (state or {}).get("temp_int_c", None)
+                h_int = (state or {}).get("hum_int_pct", None)
+                if last_int != (t_int, h_int):
+                    regions.append(REG_ROW_INT)
+                    last_int = (t_int, h_int)
+
+                t_ext = (state or {}).get("temp_ext_c", None)
+                h_ext = (state or {}).get("hum_ext_pct", None)
+                if last_ext != (t_ext, h_ext):
+                    regions.append(REG_ROW_EXT)
+                    last_ext = (t_ext, h_ext)
+
+                cpu = (state or {}).get("cpu_temp_c", None)
+                if last_cpu != cpu:
+                    regions.append(REG_ROW_CPU)
+                    last_cpu = cpu
+
+                # Only draw if not touching, and something changed
+                if (not touch_down) and regions:
+                    dirty_redraw(regions, "state-change")
+
+            # ---- Heartbeat ----
+            if now - last_hb >= HEARTBEAT_S:
+                rep = bool((state or {}).get("repeater", False))
+                cd = int((state or {}).get("cooldown", 0) or 0)
+                t = (state or {}).get("time", "")
+                log(f"HB alive frames={frames} repeater={rep} cooldown={cd} time={t}")
+                last_hb = now
+
+            time.sleep(0.005)
+
+    finally:
+        if tfd is not None:
+            try:
+                os.close(tfd)
+            except Exception:
+                pass
+        fb.close()
+        log("EXIT atexit")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
