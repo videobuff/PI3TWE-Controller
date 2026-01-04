@@ -21,3 +21,20 @@ secrets/
 
 # State / runtime dirs
 /var/
+
+# --- NEVER COMMIT ---
+*.bak
+*.bak_*
+*.db
+*.db-shm
+*.db-wal
+
+secret.key
+secrets/
+test_ip.py
+requirements.pipreqs.bad.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
