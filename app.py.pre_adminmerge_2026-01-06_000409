@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ======================================================
-# File: /srv/pi3twe/app/app.py
-# Generated: 2026-01-05 (Europe/Amsterdam)
+# File: app.py
+# Generated: 2025-12-25 (Europe/Amsterdam)
 # Description: PI3TWE Controller backend
 #  - SQLite users + audit log + settings
 #  - Login (ident OR username OR email), sessions
@@ -9,9 +9,7 @@
 #  - Admin: users list/create/delete (soft delete) + alarm settings
 #  - Repeater control + cooldown
 #  - JSON errors (no HTML error pages for API)
-#  - NEW: LAN/WAN IP in /api/state (cached)
-#  - NEW: monitor.db integration (CPU/INT/EXT temp/hum) in /api/state
-#  - NEW: /api/fail2ban endpoint (bans per jail)
+#  - New user: email temp password via msmtp
 # ======================================================
 
 from flask import Flask, jsonify, request, abort, session
@@ -34,14 +32,6 @@ import RPi.GPIO as GPIO
 # ---------------------
 DB_PATH = "/srv/pi3twe/app/pi3twe.db"
 
-# Monitor DB (temperatuur/vocht logging)
-MONITOR_DB_PATH = "/srv/pi3twe/data/monitor.db"
-
-# sources in monitor.db (pas aan als jij andere namen gebruikt)
-SRC_CPU = "cpu"
-SRC_INT = "int"
-SRC_EXT = "ext"
-
 RELAY_GPIO = 17
 COOLDOWN_SECONDS = 30
 
@@ -50,17 +40,13 @@ DEFAULT_ALARM_TRIP_C = 50.0
 DEFAULT_ALARM_CLEAR_C = 45.0
 
 # msmtp (uses /etc/msmtprc)
-MSMTP_BIN  = "/usr/bin/msmtp"
-MSMTP_CONF = "/srv/pi3twe/app/secrets/msmtprc"
-
-MAIL_FROM = "no-reply@pi3twe.nl"
+MSMTP_BIN = "/usr/bin/msmtp"
+MSMTP_CONF = "/etc/msmtprc"
+MAIL_FROM = "locatie@pi3twe.nl"
 
 # Persist secret so sessions survive service restarts
 APP_SECRET_FILE = "/srv/pi3twe/app/secrets/flask_secret.key"
 
-# WAN IP lookup (cached)
-WAN_LOOKUP_URL = "https://api.ipify.org"
-WAN_CACHE_SECONDS = 60
 
 # ---------------------
 # Helpers
@@ -110,6 +96,10 @@ def current_user_id():
 
 
 def send_mail(to_addr: str, subject: str, body: str) -> None:
+    """
+    Send mail via msmtp using /etc/msmtprc.
+    Failures are logged in audit_log but do not hard-fail the API call.
+    """
     msg = (
         f"From: {MAIL_FROM}\n"
         f"To: {to_addr}\n"
@@ -130,114 +120,6 @@ def send_mail(to_addr: str, subject: str, body: str) -> None:
             audit("MAIL_FAIL", current_user_id(), p.stderr.decode("utf-8", errors="replace")[:500])
     except Exception as e:
         audit("MAIL_FAIL", current_user_id(), f"{type(e).__name__}: {e}")
-
-
-def _run_cmd(args, timeout=2) -> str:
-    try:
-        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, text=True)
-        if p.returncode == 0:
-            return (p.stdout or "").strip()
-        return ""
-    except Exception:
-        return ""
-
-
-def get_lan_ip() -> str:
-    # voorkeur: hostname -I (eerste IPv4)
-    out = _run_cmd(["hostname", "-I"], timeout=1)
-    if out:
-        parts = [p.strip() for p in out.split() if p.strip()]
-        # kies eerste IPv4 als aanwezig
-        for p in parts:
-            if "." in p:
-                return p
-        return parts[0]
-    # fallback: ip route
-    out = _run_cmd(["sh", "-lc", "ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\") {print $(i+1); exit}}'"], timeout=1)
-    return out or ""
-
-
-_WAN_CACHE = {"ts": 0.0, "ip": ""}
-
-def get_wan_ip() -> str:
-    now = time.time()
-    if _WAN_CACHE["ip"] and (now - _WAN_CACHE["ts"]) < WAN_CACHE_SECONDS:
-        return _WAN_CACHE["ip"]
-
-    # gebruik curl met korte timeout
-    out = _run_cmd(["curl", "-sS", "--max-time", "2", WAN_LOOKUP_URL], timeout=3).strip()
-    if out and len(out) < 64:
-        _WAN_CACHE["ip"] = out
-        _WAN_CACHE["ts"] = now
-        return out
-    return _WAN_CACHE["ip"] or ""
-
-
-def read_monitor_latest(source: str):
-    """
-    Leest laatste meting uit monitor.db voor een source.
-    Verwacht tabel: measurements(ts TEXT/NUM, source TEXT, temp REAL, hum REAL)
-    """
-    if not os.path.exists(MONITOR_DB_PATH):
-        return None
-    try:
-        conn = sqlite3.connect(MONITOR_DB_PATH)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT ts, source, temp, hum FROM measurements WHERE source=? ORDER BY ts DESC LIMIT 1",
-            (source,),
-        ).fetchone()
-        conn.close()
-        if not row:
-            return None
-        # 1 decimaal
-        temp = row["temp"]
-        hum = row["hum"]
-        return {
-            "ts": row["ts"],
-            "temp": (round(float(temp), 1) if temp is not None else None),
-            "hum": (round(float(hum), 1) if hum is not None else None),
-        }
-    except Exception:
-        return None
-
-
-def fail2ban_status():
-    """
-    Returns {"total": int|None, "jails": {name:int}, "error"?: str}
-    """
-    # fail2ban-client status -> parse jails
-    out = _run_cmd(["fail2ban-client", "status"], timeout=2)
-    if not out:
-        return {"total": None, "jails": {}, "error": "fail2ban-client status niet beschikbaar"}
-
-    jails = []
-    for line in out.splitlines():
-        if "Jail list:" in line:
-            # Jail list: sshd, nginx-http-auth, ...
-            part = line.split("Jail list:", 1)[1].strip()
-            if part:
-                jails = [x.strip() for x in part.split(",") if x.strip()]
-            break
-
-    counts = {}
-    total = 0
-    for jail in jails:
-        jo = _run_cmd(["fail2ban-client", "status", jail], timeout=2)
-        if not jo:
-            continue
-        banned = None
-        for ln in jo.splitlines():
-            if "Currently banned:" in ln:
-                try:
-                    banned = int(ln.split("Currently banned:", 1)[1].strip())
-                except Exception:
-                    banned = None
-        if banned is not None:
-            counts[jail] = banned
-            total += banned
-
-    return {"total": total, "jails": counts}
 
 
 # ---------------------
@@ -263,6 +145,8 @@ GPIO.output(RELAY_GPIO, GPIO.LOW)
 STATE = {
     "repeater_on": False,
     "last_switch": 0.0,
+    "temp_c": None,
+    "hum_pct": None,
 }
 
 # ---------------------
@@ -317,7 +201,6 @@ def db_init():
             "alarm_trip": str(DEFAULT_ALARM_TRIP_C),
             "alarm_clear": str(DEFAULT_ALARM_CLEAR_C),
             "cooldown_seconds": str(COOLDOWN_SECONDS),
-            "band": "unknown",  # UI kan dit tonen; pas aan via settings of later via hardware
         }
         for k, v in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -532,6 +415,85 @@ def api_me():
 
 
 # ======================================================
+# 2FA
+# ======================================================
+@app.get("/api/2fa/setup")
+def api_2fa_setup():
+    login_required()
+    u = current_user()
+
+    secret = pyotp.random_base32()
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=u["email"], issuer_name="PI3TWE")
+
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    session["2fa_tmp"] = secret
+    return jsonify({"secret": secret, "qr": f"data:image/png;base64,{qr_b64}"})
+
+
+@app.post("/api/2fa/enable")
+def api_2fa_enable():
+    login_required()
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code") or "").strip()
+    secret = session.get("2fa_tmp")
+
+    if not secret:
+        abort(400, "Geen setup actief.")
+    if not code:
+        abort(400, "Code ontbreekt.")
+
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code):
+        abort(403, "Invalid OTP")
+
+    with db() as c:
+        c.execute("UPDATE users SET totp_secret=?, totp_enabled=1 WHERE id=?", (secret, session["uid"]))
+
+    audit("2FA_ENABLED", session["uid"])
+    session.pop("2fa_tmp", None)
+    return jsonify({"ok": True})
+
+
+# ======================================================
+# USER: CHANGE PASSWORD
+# ======================================================
+
+@app.post("/api/user/password")
+def api_user_password():
+    login_required()
+    u = current_user()
+    if not u:
+        abort(401, "Not logged in")
+
+    data = request.get_json(silent=True) or {}
+    old_pw = (data.get("old_password") or "")
+    new_pw = (data.get("new_password") or "")
+
+    if not old_pw or not new_pw:
+        abort(400, "old_password en new_password zijn verplicht")
+
+    # minimale sanity (optioneel, maar handig)
+    if len(new_pw) < 10:
+        abort(400, "Nieuw wachtwoord is te kort (minimaal 10 tekens)")
+
+    if not check_password_hash(u["pw_hash"], old_pw):
+        audit("PW_CHANGE_FAIL", u["id"], "wrong old password")
+        abort(403, "Oud wachtwoord is onjuist")
+
+    with db() as c:
+        c.execute(
+            "UPDATE users SET pw_hash=? WHERE id=?",
+            (generate_password_hash(new_pw), u["id"])
+        )
+
+    audit("PW_CHANGE_OK", u["id"])
+    return jsonify({"ok": True})
+# ======================================================
 # ADMIN: users
 # ======================================================
 @app.get("/api/admin/users")
@@ -666,18 +628,6 @@ def api_admin_alarm_set():
     return jsonify({"ok": True})
 
 
-
-
-# ======================================================
-# FAIL2BAN API
-# ======================================================
-@app.get("/api/fail2ban")
-def api_fail2ban():
-    # mag publiek of login_required; kies wat jij wilt
-    login_required()
-    return jsonify(fail2ban_status())
-
-
 # ======================================================
 # REPEATER API
 # ======================================================
@@ -693,30 +643,13 @@ def api_state():
     except Exception:
         clear = DEFAULT_ALARM_CLEAR_C
 
-    band = setting_get("band", "unknown")
-    lan = get_lan_ip()
-    wan = get_wan_ip()
-
-    cpu = read_monitor_latest(SRC_CPU)
-    it = read_monitor_latest(SRC_INT)
-    ex = read_monitor_latest(SRC_EXT)
-
     return jsonify({
         "repeater": STATE["repeater_on"],
         "cooldown": cooldown_left(),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "client_ip": client_ip(),
-
-        "lan_ip": lan,
-        "wan_ip": wan,
-        "band": band,
-
-        "monitor": {
-            "cpu": cpu,
-            "int": it,
-            "ext": ex,
-        },
-
+        "ip": client_ip(),
+        "temp_c": STATE["temp_c"],
+        "hum_pct": STATE["hum_pct"],
         "alarm": {"enabled": enabled, "trip_c": trip, "clear_c": clear}
     })
 
@@ -824,6 +757,9 @@ def ensure_superadmin_exists():
         pass
 
 
+# ======================================================
+# Main
+# ======================================================
 def main():
     db_init()
     ensure_superadmin_exists()

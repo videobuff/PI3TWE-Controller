@@ -38,9 +38,9 @@ DB_PATH = "/srv/pi3twe/app/pi3twe.db"
 MONITOR_DB_PATH = "/srv/pi3twe/data/monitor.db"
 
 # sources in monitor.db (pas aan als jij andere namen gebruikt)
-SRC_CPU = "cpu"
-SRC_INT = "int"
-SRC_EXT = "ext"
+SRC_CPU = "CPU"
+SRC_INT = "INT"
+SRC_EXT = "EXT"
 
 RELAY_GPIO = 17
 COOLDOWN_SECONDS = 30
@@ -529,143 +529,6 @@ def api_me():
         "notify_enabled": bool(u["notify_enabled"]),
         "totp_enabled": bool(u["totp_enabled"]),
     })
-
-
-# ======================================================
-# ADMIN: users
-# ======================================================
-@app.get("/api/admin/users")
-def api_admin_users_get():
-    admin_required()
-    with db() as c:
-        rows = c.execute("""
-            SELECT id, username, email, is_admin, is_superadmin, is_active, notify_enabled, totp_enabled,
-                   created_at, last_login_at, last_login_ip
-            FROM users
-            ORDER BY is_superadmin DESC, id ASC
-        """).fetchall()
-    return jsonify({"users": [dict(r) for r in rows]})
-
-
-@app.post("/api/admin/users")
-def api_admin_users_create():
-    admin_required()
-    me = current_user()
-
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    email = (data.get("email") or "").strip()
-    is_admin = bool(data.get("is_admin", True))
-    notify_enabled = bool(data.get("notify_enabled", True))
-
-    if not username or not email:
-        abort(400, "username en email zijn verplicht.")
-
-    temp_pw = secrets.token_urlsafe(16)
-    pw_hash = generate_password_hash(temp_pw)
-
-    with db() as c:
-        try:
-            c.execute("""
-                INSERT INTO users(username,email,pw_hash,is_admin,is_superadmin,is_active,notify_enabled,created_at)
-                VALUES(?,?,?,?,?,?,?,?)
-            """, (
-                username,
-                email,
-                pw_hash,
-                1 if is_admin else 0,
-                0,
-                1,
-                1 if notify_enabled else 0,
-                datetime.utcnow().isoformat(timespec="seconds"),
-            ))
-        except sqlite3.IntegrityError:
-            abort(400, "Username of email bestaat al.")
-
-    audit("USER_CREATED", me["id"], f"user={username} email={email} is_admin={is_admin} notify={notify_enabled}")
-
-    subject = "PI3TWE - account aangemaakt"
-    body = (
-        f"Hallo {username},\n\n"
-        f"Je PI3TWE account is aangemaakt.\n\n"
-        f"Inloggen:\n"
-        f"  Gebruiker/email: {username} / {email}\n"
-        f"  Tijdelijk wachtwoord: {temp_pw}\n\n"
-        f"Belangrijk:\n"
-        f"- Wijzig bij de eerste login direct je wachtwoord.\n"
-        f"- Zet daarna 2FA aan.\n\n"
-        f"Groet,\nPI3TWE Controller\n"
-    )
-    send_mail(email, subject, body)
-
-    return jsonify({"ok": True})
-
-
-@app.post("/api/admin/users/<int:user_id>/delete")
-def api_admin_user_delete(user_id: int):
-    superadmin_required()
-    me = current_user()
-
-    if int(me["id"]) == int(user_id):
-        abort(400, "Je kunt jezelf niet verwijderen.")
-
-    with db() as c:
-        u = c.execute("SELECT id, username, email, is_superadmin, is_active FROM users WHERE id=?", (user_id,)).fetchone()
-        if not u:
-            abort(404, "Gebruiker niet gevonden.")
-        if u["is_superadmin"]:
-            abort(400, "Superadmin kan niet verwijderd worden.")
-        if not u["is_active"]:
-            return jsonify({"ok": True})
-
-        c.execute("UPDATE users SET is_active=0 WHERE id=?", (user_id,))
-
-    audit("USER_DEACTIVATED", me["id"], f"user_id={user_id} username={u['username']} email={u['email']}")
-    return jsonify({"ok": True})
-
-
-# ======================================================
-# ADMIN: alarm settings
-# ======================================================
-@app.get("/api/admin/alarm")
-def api_admin_alarm_get():
-    admin_required()
-    enabled = setting_get("alarm_enabled", "1") == "1"
-    try:
-        trip = float(setting_get("alarm_trip", str(DEFAULT_ALARM_TRIP_C)))
-    except Exception:
-        trip = DEFAULT_ALARM_TRIP_C
-    try:
-        clear = float(setting_get("alarm_clear", str(DEFAULT_ALARM_CLEAR_C)))
-    except Exception:
-        clear = DEFAULT_ALARM_CLEAR_C
-
-    return jsonify({"enabled": enabled, "trip_c": trip, "clear_c": clear})
-
-
-@app.post("/api/admin/alarm")
-def api_admin_alarm_set():
-    admin_required()
-    data = request.get_json(silent=True) or {}
-
-    enabled = bool(data.get("enabled", True))
-    try:
-        trip = float(data.get("trip_c", DEFAULT_ALARM_TRIP_C))
-        clear = float(data.get("clear_c", DEFAULT_ALARM_CLEAR_C))
-    except Exception:
-        abort(400, "Ongeldige trip/clear waarde.")
-
-    if clear >= trip:
-        abort(400, "clear_c moet lager zijn dan trip_c.")
-
-    setting_set("alarm_enabled", "1" if enabled else "0")
-    setting_set("alarm_trip", str(trip))
-    setting_set("alarm_clear", str(clear))
-
-    audit("ALARM_SETTINGS", current_user_id(), f"enabled={enabled} trip={trip} clear={clear}")
-    return jsonify({"ok": True})
-
-
 
 
 # ======================================================

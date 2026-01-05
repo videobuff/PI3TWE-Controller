@@ -1,0 +1,163 @@
+<!--
+File: monitor/templates/monitor.html
+Generated: 2026-01-04
+Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
+-->
+
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PI3TWE Monitor</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-border: #2a2f3a;
+      --text: #e6e6e6;
+      --muted: #9aa0aa;
+      --accent: #4da3ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 18px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    }
+
+    h1 {
+      margin: 0 0 12px 0;
+      font-size: 22px;
+      font-weight: 600;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar .left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    input {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 6px 8px;
+      width: 90px;
+    }
+
+    button {
+      background: var(--accent);
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      padding: 6px 12px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    button:hover {
+      filter: brightness(1.1);
+    }
+
+    .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+
+    @media (min-width: 1100px) {
+      .grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      padding: 12px 14px 16px 14px;
+    }
+
+    .card h2 {
+      margin: 0 0 8px 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 260px !important;
+    }
+
+    footer {
+      margin-top: 14px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Temperatuur / Humidity Monitor</h1>
+
+  <div class="toolbar">
+    <div class="left">
+      Laatste
+      <input id="hours" type="number" min="1" max="168" value="24">
+      uur
+      <button onclick="reload()">Ververs</button>
+    </div>
+    <div class="hint">
+      /monitor/api/data • /monitor/api/health
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>CPU</h2>
+      <canvas id="cpuChart"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>INT</h2>
+      <canvas id="intChart"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>EXT</h2>
+      <canvas id="extChart"></canvas>
+    </div>
+  </div>
+
+  <footer>
+    PI3TWE Monitor • logging 60s • retentie 365 dagen
+  </footer>
+
+  <script src="/monitor/static/monitor.js"></script>
+</body>
+</html>
