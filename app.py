@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 # ======================================================
 # File: /srv/pi3twe/app/app.py
-# Generated: 2026-01-05 (Europe/Amsterdam)
+# Generated: 2026-01-06 (Europe/Amsterdam)
 # Description: PI3TWE Controller backend
 #  - SQLite users + audit log + settings
 #  - Login (ident OR username OR email), sessions
 #  - 2FA (TOTP)
-#  - Admin: users list/create/delete (soft delete) + alarm settings
+#  - Admin: users list/create/deactivate/activate + SUPERADMIN: hard delete (purge) + Alarm settings
 #  - Repeater control + cooldown
+#  - LAN/WAN + monitor.db (cpu/int/ext) + band
+#  - Fail2ban status endpoint
 #  - JSON errors (no HTML error pages for API)
-#  - NEW: LAN/WAN IP in /api/state (cached)
-#  - NEW: monitor.db integration (CPU/INT/EXT temp/hum) in /api/state
-#  - NEW: /api/fail2ban endpoint (bans per jail)
+#  - New user: email temp password via msmtp (config in secrets)
+#
+# Notes (important):
+#  - /api/admin/users/<id>/delete is kept as BACKWARD COMPAT alias for "deactivate"
+#    because the current UI calls /delete.
+#  - /api/admin/users/<id>/purge is HARD delete (weg = weg). It NULLs audit_log.user_id first.
 # ======================================================
 
 from flask import Flask, jsonify, request, abort, session
@@ -27,17 +32,18 @@ import qrcode
 import io
 import base64
 import subprocess
+import socket
+import re
 import RPi.GPIO as GPIO
+import atexit
 
 # ---------------------
 # Config
 # ---------------------
 DB_PATH = "/srv/pi3twe/app/pi3twe.db"
-
-# Monitor DB (temperatuur/vocht logging)
 MONITOR_DB_PATH = "/srv/pi3twe/data/monitor.db"
 
-# sources in monitor.db (pas aan als jij andere namen gebruikt)
+# monitor sources (match monitor.db)
 SRC_CPU = "cpu"
 SRC_INT = "int"
 SRC_EXT = "ext"
@@ -46,21 +52,21 @@ RELAY_GPIO = 17
 COOLDOWN_SECONDS = 30
 
 DEFAULT_ALARM_ENABLED = True
-DEFAULT_ALARM_TRIP_C = 50.0
-DEFAULT_ALARM_CLEAR_C = 45.0
+DEFAULT_ALARM_TRIP_C = 55.0
+DEFAULT_ALARM_CLEAR_C = 43.0
 
-# msmtp (uses /etc/msmtprc)
-MSMTP_BIN  = "/usr/bin/msmtp"
+# WAN lookup
+WAN_LOOKUP_URL = "https://api.ipify.org"
+WAN_CACHE_SECONDS = 60
+_WAN_CACHE = {"ip": "", "ts": 0.0}
+
+# msmtp (config in secrets)
+MSMTP_BIN = "/usr/bin/msmtp"
 MSMTP_CONF = "/srv/pi3twe/app/secrets/msmtprc"
-
 MAIL_FROM = "no-reply@pi3twe.nl"
 
 # Persist secret so sessions survive service restarts
 APP_SECRET_FILE = "/srv/pi3twe/app/secrets/flask_secret.key"
-
-# WAN IP lookup (cached)
-WAN_LOOKUP_URL = "https://api.ipify.org"
-WAN_CACHE_SECONDS = 60
 
 # ---------------------
 # Helpers
@@ -109,7 +115,29 @@ def current_user_id():
     return session.get("uid")
 
 
+def _run_cmd(cmd, timeout=2) -> str:
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+        out = (p.stdout or "").strip()
+        if out:
+            return out
+        return (p.stderr or "").strip()
+    except Exception:
+        return ""
+
+
 def send_mail(to_addr: str, subject: str, body: str) -> None:
+    """
+    Send mail via msmtp using MSMTP_CONF.
+    Failures are logged in audit_log but do not hard-fail the API call.
+    """
     msg = (
         f"From: {MAIL_FROM}\n"
         f"To: {to_addr}\n"
@@ -117,6 +145,15 @@ def send_mail(to_addr: str, subject: str, body: str) -> None:
         f"Content-Type: text/plain; charset=utf-8\n"
         f"\n{body}\n"
     )
+
+    # sanity: config must exist
+    if not os.path.exists(MSMTP_BIN):
+        audit("MAIL_FAIL", current_user_id(), f"msmtp binary ontbreekt: {MSMTP_BIN}")
+        return
+    if not os.path.exists(MSMTP_CONF):
+        audit("MAIL_FAIL", current_user_id(), f"msmtprc ontbreekt: {MSMTP_CONF}")
+        return
+
     try:
         p = subprocess.run(
             [MSMTP_BIN, "-C", MSMTP_CONF, "-t"],
@@ -127,44 +164,42 @@ def send_mail(to_addr: str, subject: str, body: str) -> None:
             check=False,
         )
         if p.returncode != 0:
-            audit("MAIL_FAIL", current_user_id(), p.stderr.decode("utf-8", errors="replace")[:500])
+            audit("MAIL_FAIL", current_user_id(), (p.stderr.decode("utf-8", errors="replace") or "")[:500])
     except Exception as e:
         audit("MAIL_FAIL", current_user_id(), f"{type(e).__name__}: {e}")
 
 
-def _run_cmd(args, timeout=2) -> str:
-    try:
-        p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, text=True)
-        if p.returncode == 0:
-            return (p.stdout or "").strip()
-        return ""
-    except Exception:
-        return ""
-
-
 def get_lan_ip() -> str:
-    # voorkeur: hostname -I (eerste IPv4)
-    out = _run_cmd(["hostname", "-I"], timeout=1)
-    if out:
-        parts = [p.strip() for p in out.split() if p.strip()]
-        # kies eerste IPv4 als aanwezig
-        for p in parts:
-            if "." in p:
-                return p
-        return parts[0]
-    # fallback: ip route
-    out = _run_cmd(["sh", "-lc", "ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i==\"src\") {print $(i+1); exit}}'"], timeout=1)
-    return out or ""
+    """
+    Best-effort LAN IP.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.2)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
 
+    try:
+        out = _run_cmd(["hostname", "-I"], timeout=1)
+        if out:
+            parts = [p.strip() for p in out.split() if p.strip()]
+            for p in parts:
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", p):
+                    return p
+    except Exception:
+        pass
+    return ""
 
-_WAN_CACHE = {"ts": 0.0, "ip": ""}
 
 def get_wan_ip() -> str:
     now = time.time()
     if _WAN_CACHE["ip"] and (now - _WAN_CACHE["ts"]) < WAN_CACHE_SECONDS:
         return _WAN_CACHE["ip"]
 
-    # gebruik curl met korte timeout
     out = _run_cmd(["curl", "-sS", "--max-time", "2", WAN_LOOKUP_URL], timeout=3).strip()
     if out and len(out) < 64:
         _WAN_CACHE["ip"] = out
@@ -176,7 +211,7 @@ def get_wan_ip() -> str:
 def read_monitor_latest(source: str):
     """
     Leest laatste meting uit monitor.db voor een source.
-    Verwacht tabel: measurements(ts TEXT/NUM, source TEXT, temp REAL, hum REAL)
+    Verwacht tabel: measurements(ts NUM, source TEXT, temp REAL, hum REAL)
     """
     if not os.path.exists(MONITOR_DB_PATH):
         return None
@@ -190,7 +225,6 @@ def read_monitor_latest(source: str):
         conn.close()
         if not row:
             return None
-        # 1 decimaal
         temp = row["temp"]
         hum = row["hum"]
         return {
@@ -206,7 +240,6 @@ def fail2ban_status():
     """
     Returns {"total": int|None, "jails": {name:int}, "error"?: str}
     """
-    # fail2ban-client status -> parse jails
     out = _run_cmd(["fail2ban-client", "status"], timeout=2)
     if not out:
         return {"total": None, "jails": {}, "error": "fail2ban-client status niet beschikbaar"}
@@ -214,7 +247,6 @@ def fail2ban_status():
     jails = []
     for line in out.splitlines():
         if "Jail list:" in line:
-            # Jail list: sshd, nginx-http-auth, ...
             part = line.split("Jail list:", 1)[1].strip()
             if part:
                 jails = [x.strip() for x in part.split(",") if x.strip()]
@@ -233,9 +265,11 @@ def fail2ban_status():
                     banned = int(ln.split("Currently banned:", 1)[1].strip())
                 except Exception:
                     banned = None
-        if banned is not None:
-            counts[jail] = banned
-            total += banned
+                break
+        if banned is None:
+            continue
+        counts[jail] = banned
+        total += banned
 
     return {"total": total, "jails": counts}
 
@@ -317,7 +351,7 @@ def db_init():
             "alarm_trip": str(DEFAULT_ALARM_TRIP_C),
             "alarm_clear": str(DEFAULT_ALARM_CLEAR_C),
             "cooldown_seconds": str(COOLDOWN_SECONDS),
-            "band": "unknown",  # UI kan dit tonen; pas aan via settings of later via hardware
+            "band": "unknown",
         }
         for k, v in defaults.items():
             c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -532,6 +566,94 @@ def api_me():
 
 
 # ======================================================
+# 2FA
+# ======================================================
+@app.get("/api/2fa/setup")
+def api_2fa_setup():
+    login_required()
+    u = current_user()
+
+    secret = pyotp.random_base32()
+    totp = pyotp.TOTP(secret)
+    uri = totp.provisioning_uri(name=u["email"], issuer_name="PI3TWE")
+
+    img = qrcode.make(uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    qr_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    session["2fa_tmp"] = secret
+    return jsonify({"secret": secret, "qr": f"data:image/png;base64,{qr_b64}"})
+
+
+@app.post("/api/2fa/enable")
+def api_2fa_enable():
+    login_required()
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("code") or "").strip()
+    secret = session.get("2fa_tmp")
+
+    if not secret:
+        abort(400, "Geen setup actief.")
+    if not code:
+        abort(400, "Code ontbreekt.")
+
+    totp = pyotp.TOTP(secret)
+    if not totp.verify(code):
+        abort(403, "Invalid OTP")
+
+    with db() as c:
+        c.execute("UPDATE users SET totp_secret=?, totp_enabled=1 WHERE id=?", (secret, session["uid"]))
+
+    audit("2FA_ENABLED", session["uid"])
+    session.pop("2fa_tmp", None)
+    return jsonify({"ok": True})
+
+
+# ======================================================
+# USER: CHANGE PASSWORD
+# ======================================================
+@app.post("/api/user/password")
+def api_user_password():
+    login_required()
+    u = current_user()
+    if not u:
+        abort(401, "Not logged in")
+
+    data = request.get_json(silent=True) or {}
+    old_pw = (data.get("old_password") or "")
+    new_pw = (data.get("new_password") or "")
+
+    if not old_pw or not new_pw:
+        abort(400, "old_password en new_password zijn verplicht")
+
+    if len(new_pw) < 10:
+        abort(400, "Nieuw wachtwoord is te kort (minimaal 10 tekens)")
+
+    if not check_password_hash(u["pw_hash"], old_pw):
+        audit("PW_CHANGE_FAIL", u["id"], "wrong old password")
+        abort(403, "Oud wachtwoord is onjuist")
+
+    with db() as c:
+        c.execute(
+            "UPDATE users SET pw_hash=? WHERE id=?",
+            (generate_password_hash(new_pw), u["id"])
+        )
+
+    audit("PW_CHANGE_OK", u["id"])
+    return jsonify({"ok": True})
+
+
+# ======================================================
+# FAIL2BAN API
+# ======================================================
+@app.get("/api/fail2ban")
+def api_fail2ban():
+    login_required()
+    return jsonify(fail2ban_status())
+
+
+# ======================================================
 # ADMIN: users
 # ======================================================
 @app.get("/api/admin/users")
@@ -601,8 +723,75 @@ def api_admin_users_create():
     return jsonify({"ok": True})
 
 
+def _deactivate_user(user_id: int):
+    superadmin_required()
+    me = current_user()
+
+    if int(me["id"]) == int(user_id):
+        abort(400, "Je kunt jezelf niet deactiveren.")
+
+    with db() as c:
+        u = c.execute(
+            "SELECT id, username, email, is_superadmin, is_active FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if not u:
+            abort(404, "Gebruiker niet gevonden.")
+        if int(u["is_superadmin"]) == 1:
+            abort(400, "Superadmin kan niet gedeactiveerd worden.")
+        if int(u["is_active"]) == 0:
+            return jsonify({"ok": True})
+
+        c.execute("UPDATE users SET is_active=0 WHERE id=?", (user_id,))
+
+    audit("USER_DEACTIVATED", me["id"], f"user_id={user_id} username={u['username']} email={u['email']}")
+    return jsonify({"ok": True})
+
+
+# BACKWARD COMPAT: UI used to call /delete (but it was actually deactivate)
 @app.post("/api/admin/users/<int:user_id>/delete")
-def api_admin_user_delete(user_id: int):
+def api_admin_user_delete_alias(user_id: int):
+    return _deactivate_user(user_id)
+
+
+@app.post("/api/admin/users/<int:user_id>/deactivate")
+def api_admin_user_deactivate(user_id: int):
+    return _deactivate_user(user_id)
+
+
+@app.post("/api/admin/users/<int:user_id>/activate")
+def api_admin_user_activate(user_id: int):
+    superadmin_required()
+    me = current_user()
+
+    with db() as c:
+        u = c.execute(
+            "SELECT id, username, email, is_superadmin, is_active FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if not u:
+            abort(404, "Gebruiker niet gevonden.")
+        if int(u["is_superadmin"]) == 1:
+            abort(400, "Superadmin kan niet (her)geactiveerd worden.")
+        if int(u["is_active"]) == 1:
+            return jsonify({"ok": True})
+
+        c.execute("UPDATE users SET is_active=1 WHERE id=?", (user_id,))
+
+    audit("USER_ACTIVATED", me["id"], f"user_id={user_id} username={u['username']} email={u['email']}")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/admin/users/<int:user_id>/purge")
+def api_admin_user_purge(user_id: int):
+    """
+    HARD delete: echt uit users verwijderen (weg = weg).
+    Voor veiligheid: alleen superadmin, nooit self, nooit superadmin.
+
+    Belangrijk:
+    - audit_log heeft een FK naar users(id) zonder ON DELETE SET NULL.
+      Daarom zetten we audit_log.user_id eerst op NULL.
+    """
     superadmin_required()
     me = current_user()
 
@@ -610,17 +799,22 @@ def api_admin_user_delete(user_id: int):
         abort(400, "Je kunt jezelf niet verwijderen.")
 
     with db() as c:
-        u = c.execute("SELECT id, username, email, is_superadmin, is_active FROM users WHERE id=?", (user_id,)).fetchone()
+        u = c.execute(
+            "SELECT id, username, email, is_superadmin FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
         if not u:
             abort(404, "Gebruiker niet gevonden.")
-        if u["is_superadmin"]:
+        if int(u["is_superadmin"]) == 1:
             abort(400, "Superadmin kan niet verwijderd worden.")
-        if not u["is_active"]:
-            return jsonify({"ok": True})
 
-        c.execute("UPDATE users SET is_active=0 WHERE id=?", (user_id,))
+        # Detach audit_log references to avoid FK issues
+        c.execute("UPDATE audit_log SET user_id=NULL WHERE user_id=?", (user_id,))
 
-    audit("USER_DEACTIVATED", me["id"], f"user_id={user_id} username={u['username']} email={u['email']}")
+        # Delete user (hard delete)
+        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+
+    audit("USER_PURGED", me["id"], f"user_id={user_id} username={u['username']} email={u['email']}")
     return jsonify({"ok": True})
 
 
@@ -664,18 +858,6 @@ def api_admin_alarm_set():
 
     audit("ALARM_SETTINGS", current_user_id(), f"enabled={enabled} trip={trip} clear={clear}")
     return jsonify({"ok": True})
-
-
-
-
-# ======================================================
-# FAIL2BAN API
-# ======================================================
-@app.get("/api/fail2ban")
-def api_fail2ban():
-    # mag publiek of login_required; kies wat jij wilt
-    login_required()
-    return jsonify(fail2ban_status())
 
 
 # ======================================================
@@ -779,7 +961,6 @@ def root():
 # ======================================================
 # Cleanup
 # ======================================================
-import atexit
 @atexit.register
 def cleanup():
     try:
@@ -824,6 +1005,9 @@ def ensure_superadmin_exists():
         pass
 
 
+# ======================================================
+# Main
+# ======================================================
 def main():
     db_init()
     ensure_superadmin_exists()
