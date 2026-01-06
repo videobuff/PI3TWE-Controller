@@ -239,11 +239,39 @@ def read_monitor_latest(source: str):
 def fail2ban_status():
     """
     Returns {"total": int|None, "jails": {name:int}, "error"?: str}
-    """
-    out = _run_cmd(["fail2ban-client", "status"], timeout=2)
-    if not out:
-        return {"total": None, "jails": {}, "error": "fail2ban-client status niet beschikbaar"}
 
+    Uses sudo (NOPASSWD) because fail2ban socket is root-only.
+    Will NEVER raise; failures become {"error": "..."}.
+    """
+    import subprocess
+
+    SUDO = "/usr/bin/sudo"
+    F2B  = "/usr/bin/fail2ban-client"
+
+    def run(args, timeout=2):
+        try:
+            p = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            out = (p.stdout or "").strip()
+            err = (p.stderr or "").strip()
+            return p.returncode, out, err
+        except Exception as e:
+            return 999, "", f"{type(e).__name__}: {e}"
+
+    # 1) global status
+    rc, out, err = run([SUDO, "-n", F2B, "status"], timeout=2)
+
+    if rc != 0:
+        msg = err or out or f"fail2ban status rc={rc}"
+        return {"total": None, "jails": {}, "error": msg[:300]}
+
+    # Parse jail list
     jails = []
     for line in out.splitlines():
         if "Jail list:" in line:
@@ -254,26 +282,32 @@ def fail2ban_status():
 
     counts = {}
     total = 0
+
+    # 2) per-jail status
     for jail in jails:
-        jo = _run_cmd(["fail2ban-client", "status", jail], timeout=2)
-        if not jo:
+        rc2, out2, err2 = run([SUDO, "-n", F2B, "status", jail], timeout=2)
+        if rc2 != 0 or not out2:
+            # do not fail entire endpoint; just skip this jail
             continue
+
         banned = None
-        for ln in jo.splitlines():
+        for ln in out2.splitlines():
             if "Currently banned:" in ln:
                 try:
                     banned = int(ln.split("Currently banned:", 1)[1].strip())
                 except Exception:
                     banned = None
                 break
+
         if banned is None:
             continue
+
         counts[jail] = banned
         total += banned
 
     return {"total": total, "jails": counts}
-
-
+    
+    
 # ---------------------
 # Flask
 # ---------------------
