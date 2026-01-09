@@ -36,6 +36,7 @@ import socket
 import re
 import RPi.GPIO as GPIO
 import atexit
+from fastapi import Response
 
 # ---------------------
 # Config

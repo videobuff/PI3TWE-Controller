@@ -1,6 +1,7 @@
 <!--
 File: monitor/templates/monitor.html
 Generated: 2026-01-04
+Updated  : 2026-01-06 (Europe/Amsterdam)
 Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
 -->
 
@@ -10,7 +11,6 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>PI3TWE Monitor</title>
-
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
   <style>
@@ -52,6 +52,14 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
       display: flex;
       align-items: center;
       gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar .right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
     }
 
     input {
@@ -63,7 +71,7 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
       width: 90px;
     }
 
-    button {
+    button, .btnlink {
       background: var(--accent);
       color: #000;
       border: none;
@@ -71,15 +79,30 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
       padding: 6px 12px;
       cursor: pointer;
       font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      line-height: 1;
     }
 
-    button:hover {
+    button:hover, .btnlink:hover {
       filter: brightness(1.1);
     }
 
     .hint {
       font-size: 12px;
       color: var(--muted);
+    }
+
+    .muted { color: var(--muted); }
+
+    select {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 6px 8px;
     }
 
     .grid {
@@ -89,9 +112,7 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
     }
 
     @media (min-width: 1100px) {
-      .grid {
-        grid-template-columns: repeat(3, 1fr);
-      }
+      .grid { grid-template-columns: repeat(3, 1fr); }
     }
 
     .card {
@@ -130,10 +151,22 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
       Laatste
       <input id="hours" type="number" min="1" max="168" value="24">
       uur
+
       <button onclick="reload()">Ververs</button>
+
+      <label for="refresh" class="muted" style="margin-left:12px;">Auto</label>
+      <select id="refresh">
+        <option value="1">1s</option>
+        <option value="10" selected>10s</option>
+        <option value="0">uit</option>
+      </select>
+
+      <button id="btnReload" type="button">Ververs</button>
     </div>
-    <div class="hint">
-      /monitor/api/data • /monitor/api/health
+
+    <div class="right">
+      <a class="btnlink" href="/monitor/live/" target="_self" rel="noopener">Live</a>
+      <div class="hint">/monitor/api/data • /monitor/api/health</div>
     </div>
   </div>
 
@@ -158,6 +191,6 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
     PI3TWE Monitor • logging 60s • retentie 365 dagen
   </footer>
 
-  <script src="/monitor/static/monitor.js"></script>
+  <script src="/monitor/static/monitor.js?v=20260106-1456"></script>
 </body>
 </html>
