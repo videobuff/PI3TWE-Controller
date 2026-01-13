@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-09  (Europe/Amsterdam)
+# Generated   : 2026-01-13  (Europe/Amsterdam)
 # Description :
-#   PI3TWE TFT UI – framebuffer only (RGB565), NO buttons, NO touch actions.
+#   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #
-#   This version reads the existing backend endpoint:
+#   Reads backend:
 #     GET  {PI3TWE_BACKEND}/api/state
-#   (No token header, because app.py is not modified.)
 #
 #   Screen:
 #   - Clock top-right with seconds (always updates)
-#   - WAN IP centered (yellow)
-#   - Repeater status centered (AAN=red block, UIT=blue block)
-#   - Bottom measurements: INT/EXT/CPU from /api/state.monitor.{int,ext,cpu}
-#   - COOLDOWN line only shown if cooldown > 0
+#   - WAN IP centered (WHITE + bigger)
+#   - Repeater status centered (AAN=BRIGHT RED block, UIT=blue block)
+#   - Measurements directly under the repeater status block:
+#       INT/EXT/CPU (+ COOLDOWN if >0)
 #   - Stale handling: if no valid payload for >10s -> placeholders
 #   - Logging to /var/log/pi3twe/tft.log
+#
+#   Power management (requested):
+#   - On any user action (web command or button), TFT screen turns ON
+#   - After 5 minutes (300s) without further user action, TFT turns OFF
+#   - Uses /sys/class/backlight/* when available; otherwise keeps drawing but cannot
+#     physically switch off backlight (logs a warning).
+#
+#   Color rules:
+#   - Repeater ON: bright red
+#   - Temp thresholds: green <=70.0, orange <=80.0, red >80.0
 # =============================================================================
 
 from __future__ import annotations
@@ -48,6 +57,9 @@ HTTP_TIMEOUT_S = float(os.environ.get("PI3TWE_TFT_HTTP_TIMEOUT", "2.0"))
 
 LOGFILE = os.environ.get("PI3TWE_TFT_LOG", "/var/log/pi3twe/tft.log")
 
+# Inactivity timeout (seconds)
+INACTIVITY_OFF_S = float(os.environ.get("PI3TWE_TFT_IDLE_OFF_S", "300"))
+
 # Layout
 PAD = 16
 HEADER_Y = 10
@@ -55,13 +67,15 @@ HEADER_Y = 10
 # Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
-YELLOW = (255, 210, 0)
-RED_ON = (180, 0, 0)
+
+# Repeater blocks
+RED_ON = (255, 0, 0)         # BRIGHT RED
 BLUE_OFF = (0, 80, 180)
 
+# Measurement colors
 GREEN_OK = (0, 220, 0)
 ORANGE_WARN = (255, 140, 0)
-RED_BAD = (230, 0, 0)
+RED_BAD = (255, 0, 0)        # BRIGHT RED for >80C
 
 # Fonts
 FONT_REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -99,7 +113,7 @@ def pick_font(path: str, size: int) -> ImageFont.ImageFont:
 
 def http_get_json(url: str, timeout: float) -> Optional[dict]:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.3"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
     except Exception as e:
@@ -128,9 +142,9 @@ def fmt_1(v: Optional[float], suffix: str = "") -> str:
 def color_for_temp_c(v: Optional[float]) -> tuple[int, int, int]:
     if v is None:
         return WHITE
-    if v < 40.0:
+    if v <= 70.0:
         return GREEN_OK
-    if v <= 55.0:
+    if v <= 80.0:
         return ORANGE_WARN
     return RED_BAD
 
@@ -155,28 +169,24 @@ def placeholder_state() -> dict:
         "temp_ext_c": None,
         "hum_ext_pct": None,
         "cpu_temp_c": None,
+        # power mgmt
+        "last_user_action_ts": None,
+        "last_user_action_age_s": None,
     }
 
 
 def parse_api_state(payload: dict) -> dict:
-    """
-    Convert app.py /api/state payload to TFT state dict expected by UI.
-    app.py returns:
-      {
-        "repeater": bool,
-        "cooldown": int,
-        "wan_ip": str,
-        "monitor": {"cpu":{temp,hum}, "int":{temp,hum}, "ext":{temp,hum}}
-      }
-    """
     out = placeholder_state()
-
     try:
         out["repeater"] = bool(payload.get("repeater", False))
         out["cooldown"] = int(payload.get("cooldown", 0) or 0)
 
         wan = (payload.get("wan_ip") or "").strip()
         out["ip_external"] = wan if wan else "—"
+
+        # power mgmt fields from backend
+        out["last_user_action_ts"] = payload.get("last_user_action_ts")
+        out["last_user_action_age_s"] = payload.get("last_user_action_age_s")
 
         mon = payload.get("monitor") or {}
         it = mon.get("int") if isinstance(mon, dict) else None
@@ -193,11 +203,109 @@ def parse_api_state(payload: dict) -> dict:
 
         if isinstance(cpu, dict):
             out["cpu_temp_c"] = as_float(cpu.get("temp"))
-
     except Exception as e:
         log(f"PARSE ERROR: {type(e).__name__}: {e}")
-
     return out
+
+
+# ------------------------------ Backlight control ----------------------------
+
+class BacklightController:
+    """
+    Best effort backlight control using /sys/class/backlight/*
+
+    Many SPI TFTs expose:
+      /sys/class/backlight/<name>/brightness
+      /sys/class/backlight/<name>/bl_power   (0=on, 4=off) on many drivers
+
+    If nothing exists or permission denied, we simply log and do not hard-fail.
+    """
+
+    def __init__(self) -> None:
+        self.brightness_path: Optional[str] = None
+        self.bl_power_path: Optional[str] = None
+        self.max_brightness: Optional[int] = None
+        self._is_on: Optional[bool] = None
+
+        self._discover()
+
+    def _discover(self) -> None:
+        base = "/sys/class/backlight"
+        try:
+            if not os.path.isdir(base):
+                log("BACKLIGHT: /sys/class/backlight not present; cannot control backlight.")
+                return
+            entries = sorted(os.listdir(base))
+            for name in entries:
+                d = os.path.join(base, name)
+                bp = os.path.join(d, "brightness")
+                mp = os.path.join(d, "max_brightness")
+                pp = os.path.join(d, "bl_power")
+                if os.path.isfile(bp):
+                    self.brightness_path = bp
+                    if os.path.isfile(mp):
+                        try:
+                            with open(mp, "r", encoding="utf-8") as f:
+                                self.max_brightness = int(f.read().strip() or "0") or None
+                        except Exception:
+                            self.max_brightness = None
+                    if os.path.isfile(pp):
+                        self.bl_power_path = pp
+                    log(f"BACKLIGHT: using {d} (brightness={bool(self.brightness_path)} bl_power={bool(self.bl_power_path)} max={self.max_brightness})")
+                    return
+
+            log("BACKLIGHT: no usable backlight entries found under /sys/class/backlight.")
+        except Exception as e:
+            log(f"BACKLIGHT: discovery error: {type(e).__name__}: {e}")
+
+    def _write_sysfs(self, path: str, value: str) -> bool:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(value)
+            return True
+        except Exception as e:
+            log(f"BACKLIGHT: write failed {path}={value!r}: {type(e).__name__}: {e}")
+            return False
+
+    def on(self) -> None:
+        if self._is_on is True:
+            return
+        ok = False
+
+        # Prefer bl_power if available
+        if self.bl_power_path:
+            ok = self._write_sysfs(self.bl_power_path, "0")
+
+        # brightness as fallback/extra
+        if self.brightness_path:
+            val = None
+            if self.max_brightness and self.max_brightness > 0:
+                val = str(self.max_brightness)
+            else:
+                val = "255"
+            ok2 = self._write_sysfs(self.brightness_path, val)
+            ok = ok or ok2
+
+        if ok:
+            self._is_on = True
+
+    def off(self) -> None:
+        if self._is_on is False:
+            return
+        ok = False
+
+        if self.bl_power_path:
+            ok = self._write_sysfs(self.bl_power_path, "4")
+
+        if self.brightness_path:
+            ok2 = self._write_sysfs(self.brightness_path, "0")
+            ok = ok or ok2
+
+        if ok:
+            self._is_on = False
+
+    def is_supported(self) -> bool:
+        return bool(self.brightness_path or self.bl_power_path)
 
 
 # ------------------------------ Framebuffer ---------------------------------
@@ -272,24 +380,24 @@ def build_screen(state: dict) -> Image.Image:
 
     font_h = pick_font(FONT_BOLD, 30)
     font_r = pick_font(FONT_BOLD, 36)
-    font_s = pick_font(FONT_REG, 18)
+    font_wan = pick_font(FONT_REG, 27)
     font_meas = pick_font(FONT_BOLD, 24)
 
-    # Title (left)
+    # Title
     d.text((PAD, HEADER_Y), "PI3TWE STATUS", font=font_h, fill=WHITE)
 
-    # Clock (right) - always updates
+    # Clock
     clk = datetime.now().strftime("%H:%M:%S")
     tw = d.textlength(clk, font=font_h)
     d.text((W - PAD - int(tw), HEADER_Y), clk, font=font_h, fill=WHITE)
 
-    # WAN IP centered
+    # WAN IP
     wan = (state or {}).get("ip_external") or "—"
     wan_line = f"WAN IP: {wan}"
-    wtw = d.textlength(wan_line, font=font_s)
-    d.text(((W - int(wtw)) // 2, HEADER_Y + 44), wan_line, font=font_s, fill=YELLOW)
+    wtw = d.textlength(wan_line, font=font_wan)
+    d.text(((W - int(wtw)) // 2, HEADER_Y + 44), wan_line, font=font_wan, fill=WHITE)
 
-    # Repeater status block
+    # Repeater block
     rep = bool((state or {}).get("repeater", False))
     rep_txt = "REPEATER = AAN" if rep else "REPEATER = UIT"
     rep_col = RED_ON if rep else BLUE_OFF
@@ -324,10 +432,9 @@ def build_screen(state: dict) -> Image.Image:
     if cooldown > 0:
         rows.append(("COOLDOWN", f"{cooldown:02d} s", None, WHITE, WHITE))
 
+    # Measurements directly under status block
     line_h = 32
-    bottom_pad = 8
-    start_y = H - (len(rows) * line_h) - bottom_pad - 10
-    y = start_y
+    y = ry + block_h + 14
 
     def draw_centered_segments(ypos: int, segments: list[tuple[str, tuple[int, int, int]]]) -> None:
         total_w = 0.0
@@ -363,14 +470,34 @@ signal.signal(signal.SIGINT, _sig)
 signal.signal(signal.SIGTERM, _sig)
 
 
+def should_screen_be_on(state: dict, last_ok: float) -> bool:
+    """
+    Decide ON/OFF based on backend last_user_action_age_s.
+    - If backend provides age: ON when age <= INACTIVITY_OFF_S
+    - If no age provided yet: keep ON (avoid accidental blank)
+    - If stale backend >10s: keep current behavior (handled by caller)
+    """
+    age = (state or {}).get("last_user_action_age_s")
+    try:
+        if age is None:
+            return True
+        return float(age) <= float(INACTIVITY_OFF_S)
+    except Exception:
+        return True
+
+
 def main() -> int:
     fb = Framebuffer(FB)
+    bl = BacklightController()
 
     state: dict = placeholder_state()
     last_fetch = 0.0
     last_ok = 0.0
 
-    log(f"START backend={BACKEND_BASE} refresh={REFRESH_S}s timeout={HTTP_TIMEOUT_S}s fb={FB}")
+    screen_on = True
+    bl.on()
+
+    log(f"START backend={BACKEND_BASE} refresh={REFRESH_S}s timeout={HTTP_TIMEOUT_S}s fb={FB} idle_off={INACTIVITY_OFF_S}s backlight_supported={bl.is_supported()}")
 
     try:
         while RUN:
@@ -383,20 +510,44 @@ def main() -> int:
                     state = parse_api_state(payload)
                     last_ok = now
                 else:
-                    # If stale for too long: reset placeholders (but keep drawing clock)
+                    # Stale handling
                     if (now - last_ok) > 10.0:
                         state = placeholder_state()
                         log("TFT state stale >10s, reset placeholders")
 
                 last_fetch = now
 
-            # Always draw (clock must keep running)
-            img = build_screen(state)
+            # Power management decision
+            desired_on = True
+            if (now - last_ok) <= 10.0:
+                desired_on = should_screen_be_on(state, last_ok)
+            else:
+                # backend stale; keep current (avoid flicker/blackout due to missing data)
+                desired_on = screen_on
+
+            if desired_on != screen_on:
+                screen_on = desired_on
+                if screen_on:
+                    bl.on()
+                    log("SCREEN: ON (activity detected or within timeout)")
+                else:
+                    bl.off()
+                    log("SCREEN: OFF (idle timeout reached)")
+
+            # Drawing: keep drawing even if off (cheap); if backlight unsupported, it still shows.
+            if screen_on:
+                img = build_screen(state)
+            else:
+                img = Image.new("RGB", (W, H), BLACK)
             fb.blit(image_to_rgb565(img))
 
             time.sleep(0.05)
 
     finally:
+        try:
+            bl.on()  # ensure ON on exit (optional; helps after manual stop)
+        except Exception:
+            pass
         fb.close()
         log("EXIT")
 

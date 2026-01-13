@@ -38,3 +38,10 @@ requirements.pipreqs.bad.txt
 __pycache__/
 *.pyc
 .venv/
+
+# PI3TWE secrets/logs/runtime
+secrets/
+*.log
+*.db
+__pycache__/
+.venv/

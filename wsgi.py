@@ -5,4 +5,6 @@
 # Description: WSGI entrypoint for Gunicorn (imports Flask app)
 # ======================================================
 
-from app import app
+from app import app, init_for_gunicorn
+
+init_for_gunicorn()
