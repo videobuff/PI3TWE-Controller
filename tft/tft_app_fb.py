@@ -13,7 +13,7 @@
 #   - WAN IP centered (WHITE + bigger)
 #   - Repeater status centered (AAN=BRIGHT RED block, UIT=blue block)
 #   - Measurements directly under the repeater status block:
-#       INT/EXT/CPU (+ COOLDOWN if >0)
+#       INT/EXT/CPU (+ COOLDOWN if >0, else UPTIME on bottom row)
 #   - Stale handling: if no valid payload for >10s -> placeholders
 #   - Logging to /var/log/pi3twe/tft.log
 #
@@ -159,6 +159,35 @@ def color_for_hum_pct(v: Optional[float]) -> tuple[int, int, int]:
     return RED_BAD
 
 
+def read_uptime_seconds() -> Optional[int]:
+    """
+    Read system uptime from /proc/uptime.
+    Returns seconds (int) or None on error.
+    """
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            txt = f.read().strip().split()
+        if not txt:
+            return None
+        return int(float(txt[0]))
+    except Exception:
+        return None
+
+
+def format_uptime(secs: Optional[int]) -> str:
+    if secs is None or secs < 0:
+        return "—"
+    days = secs // 86400
+    rem = secs % 86400
+    h = rem // 3600
+    rem %= 3600
+    m = rem // 60
+    s = rem % 60
+    if days > 0:
+        return f"{days}d {h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def placeholder_state() -> dict:
     return {
         "ip_external": "—",
@@ -172,6 +201,8 @@ def placeholder_state() -> dict:
         # power mgmt
         "last_user_action_ts": None,
         "last_user_action_age_s": None,
+        # local uptime
+        "uptime_text": "—",
     }
 
 
@@ -213,12 +244,6 @@ def parse_api_state(payload: dict) -> dict:
 class BacklightController:
     """
     Best effort backlight control using /sys/class/backlight/*
-
-    Many SPI TFTs expose:
-      /sys/class/backlight/<name>/brightness
-      /sys/class/backlight/<name>/bl_power   (0=on, 4=off) on many drivers
-
-    If nothing exists or permission denied, we simply log and do not hard-fail.
     """
 
     def __init__(self) -> None:
@@ -226,7 +251,6 @@ class BacklightController:
         self.bl_power_path: Optional[str] = None
         self.max_brightness: Optional[int] = None
         self._is_on: Optional[bool] = None
-
         self._discover()
 
     def _discover(self) -> None:
@@ -272,13 +296,10 @@ class BacklightController:
             return
         ok = False
 
-        # Prefer bl_power if available
         if self.bl_power_path:
             ok = self._write_sysfs(self.bl_power_path, "0")
 
-        # brightness as fallback/extra
         if self.brightness_path:
-            val = None
             if self.max_brightness and self.max_brightness > 0:
                 val = str(self.max_brightness)
             else:
@@ -341,7 +362,6 @@ class Framebuffer:
             self.size = int(self.w) * int(self.h) * 2
 
         self.mm = mmap.mmap(self.fd, int(self.size), mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
-
         log(f"FB open path={self.path} xres={self.w} yres={self.h} bpp={self.bpp} line={self.line} size={self.size}")
 
     def close(self) -> None:
@@ -380,8 +400,14 @@ def build_screen(state: dict) -> Image.Image:
 
     font_h = pick_font(FONT_BOLD, 30)
     font_r = pick_font(FONT_BOLD, 36)
-    font_wan = pick_font(FONT_REG, 27)
+
+    # WAN font iets kleiner (ruimte bij lange IPs)
+    font_wan = pick_font(FONT_REG, 24)
+
     font_meas = pick_font(FONT_BOLD, 24)
+
+    # Uptime-regel: expliciet font size 23
+    font_uptime = pick_font(FONT_BOLD, 23)
 
     # Title
     d.text((PAD, HEADER_Y), "PI3TWE STATUS", font=font_h, fill=WHITE)
@@ -429,28 +455,38 @@ def build_screen(state: dict) -> Image.Image:
         ("EXT TEMP", fmt_1(t_ext, " C"), fmt_1(h_ext, " %"), color_for_temp_c(t_ext), color_for_hum_pct(h_ext)),
         ("CPU TEMP", fmt_1(t_cpu, " C"), None,              color_for_temp_c(t_cpu), WHITE),
     ]
+
+    # Onderste regel: cooldown OF uptime
     if cooldown > 0:
         rows.append(("COOLDOWN", f"{cooldown:02d} s", None, WHITE, WHITE))
+    else:
+        uptime_text = (state or {}).get("uptime_text") or "—"
+        # We doen dit als “label + value” (geen humidity kolom)
+        rows.append(("UPTIME", uptime_text, None, WHITE, WHITE))
 
     # Measurements directly under status block
     line_h = 32
     y = ry + block_h + 14
 
-    def draw_centered_segments(ypos: int, segments: list[tuple[str, tuple[int, int, int]]]) -> None:
+    def draw_centered_segments(ypos: int, segments: list[tuple[str, tuple[int, int, int]]], font: ImageFont.ImageFont) -> None:
         total_w = 0.0
         for text, _col in segments:
-            total_w += d.textlength(text, font=font_meas)
+            total_w += d.textlength(text, font=font)
         x = (W - int(total_w)) // 2
         for text, col in segments:
-            d.text((x, ypos), text, font=font_meas, fill=col)
-            x += int(d.textlength(text, font=font_meas))
+            d.text((x, ypos), text, font=font, fill=col)
+            x += int(d.textlength(text, font=font))
 
     for label, v1, v2, col_v1, col_v2 in rows:
+        # Uptime regel expliciet font 23
+        use_font = font_uptime if label == "UPTIME" else font_meas
+
         if v2 is None:
             segments = [(f"{label}: ", WHITE), (v1, col_v1)]
         else:
             segments = [(f"{label}: ", WHITE), (v1, col_v1), ("   ", WHITE), (v2, col_v2)]
-        draw_centered_segments(y, segments)
+
+        draw_centered_segments(y, segments, use_font)
         y += line_h
 
     return im
@@ -503,16 +539,26 @@ def main() -> int:
         while RUN:
             now = time.time()
 
+            # Altijd lokale uptime updaten (ook als backend stale is)
+            up_s = read_uptime_seconds()
+            up_txt = format_uptime(up_s)
+            state["uptime_text"] = up_txt
+
             # Fetch (throttled)
             if (now - last_fetch) >= REFRESH_S:
                 payload = http_get_json(f"{BACKEND_BASE}/api/state", timeout=HTTP_TIMEOUT_S)
                 if isinstance(payload, dict) and payload.get("repeater") is not None:
-                    state = parse_api_state(payload)
+                    state_new = parse_api_state(payload)
+                    # behoud lokaal berekende uptime
+                    state_new["uptime_text"] = up_txt
+                    state = state_new
                     last_ok = now
                 else:
                     # Stale handling
                     if (now - last_ok) > 10.0:
-                        state = placeholder_state()
+                        st = placeholder_state()
+                        st["uptime_text"] = up_txt
+                        state = st
                         log("TFT state stale >10s, reset placeholders")
 
                 last_fetch = now
@@ -534,18 +580,18 @@ def main() -> int:
                     bl.off()
                     log("SCREEN: OFF (idle timeout reached)")
 
-            # Drawing: keep drawing even if off (cheap); if backlight unsupported, it still shows.
+            # Drawing
             if screen_on:
                 img = build_screen(state)
             else:
                 img = Image.new("RGB", (W, H), BLACK)
-            fb.blit(image_to_rgb565(img))
 
+            fb.blit(image_to_rgb565(img))
             time.sleep(0.05)
 
     finally:
         try:
-            bl.on()  # ensure ON on exit (optional; helps after manual stop)
+            bl.on()
         except Exception:
             pass
         fb.close()
