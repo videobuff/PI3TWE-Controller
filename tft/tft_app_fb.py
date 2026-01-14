@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-13  (Europe/Amsterdam)
+# Generated   : 2026-01-14 19:00 (Europe/Amsterdam)
 # Description :
 #   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #
@@ -10,10 +10,11 @@
 #
 #   Screen:
 #   - Clock top-right with seconds (always updates)
-#   - WAN IP centered (WHITE + bigger)
+#   - WAN line centered: "<UPLINK> | WAN IP: x.x.x.x"
 #   - Repeater status centered (AAN=BRIGHT RED block, UIT=blue block)
 #   - Measurements directly under the repeater status block:
 #       INT/EXT/CPU (+ COOLDOWN if >0, else UPTIME on bottom row)
+#     CPU line includes CPU load % when provided by backend.
 #   - Stale handling: if no valid payload for >10s -> placeholders
 #   - Logging to /var/log/pi3twe/tft.log
 #
@@ -113,7 +114,7 @@ def pick_font(path: str, size: int) -> ImageFont.ImageFont:
 
 def http_get_json(url: str, timeout: float) -> Optional[dict]:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.3"})
+        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.4"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
     except Exception as e:
@@ -137,6 +138,15 @@ def fmt_1(v: Optional[float], suffix: str = "") -> str:
         return f"{float(v):.1f}{suffix}"
     except Exception:
         return "--.-" + suffix
+
+
+def fmt_pct0(v: Optional[float]) -> str:
+    if v is None:
+        return "--%"
+    try:
+        return f"{int(round(float(v)))}%"
+    except Exception:
+        return "--%"
 
 
 def color_for_temp_c(v: Optional[float]) -> tuple[int, int, int]:
@@ -191,6 +201,7 @@ def format_uptime(secs: Optional[int]) -> str:
 def placeholder_state() -> dict:
     return {
         "ip_external": "—",
+        "uplink": "WAN",
         "repeater": False,
         "cooldown": 0,
         "temp_int_c": None,
@@ -198,6 +209,7 @@ def placeholder_state() -> dict:
         "temp_ext_c": None,
         "hum_ext_pct": None,
         "cpu_temp_c": None,
+        "cpu_load_pct": None,
         # power mgmt
         "last_user_action_ts": None,
         "last_user_action_age_s": None,
@@ -214,6 +226,9 @@ def parse_api_state(payload: dict) -> dict:
 
         wan = (payload.get("wan_ip") or "").strip()
         out["ip_external"] = wan if wan else "—"
+
+        upl = (payload.get("wan_uplink") or "").strip()
+        out["uplink"] = upl if upl else "WAN"
 
         # power mgmt fields from backend
         out["last_user_action_ts"] = payload.get("last_user_action_ts")
@@ -234,6 +249,7 @@ def parse_api_state(payload: dict) -> dict:
 
         if isinstance(cpu, dict):
             out["cpu_temp_c"] = as_float(cpu.get("temp"))
+            out["cpu_load_pct"] = as_float(cpu.get("load"))
     except Exception as e:
         log(f"PARSE ERROR: {type(e).__name__}: {e}")
     return out
@@ -402,7 +418,7 @@ def build_screen(state: dict) -> Image.Image:
     font_r = pick_font(FONT_BOLD, 36)
 
     # WAN font iets kleiner (ruimte bij lange IPs)
-    font_wan = pick_font(FONT_REG, 24)
+    font_wan = pick_font(FONT_REG, 23)
 
     font_meas = pick_font(FONT_BOLD, 24)
 
@@ -417,9 +433,10 @@ def build_screen(state: dict) -> Image.Image:
     tw = d.textlength(clk, font=font_h)
     d.text((W - PAD - int(tw), HEADER_Y), clk, font=font_h, fill=WHITE)
 
-    # WAN IP
+    # WAN IP line: "<UPLINK> | WAN IP: x.x.x.x"
+    uplink = (state or {}).get("uplink") or "WAN"
     wan = (state or {}).get("ip_external") or "—"
-    wan_line = f"WAN IP: {wan}"
+    wan_line = f"{uplink} | WAN IP: {wan}"
     wtw = d.textlength(wan_line, font=font_wan)
     d.text(((W - int(wtw)) // 2, HEADER_Y + 44), wan_line, font=font_wan, fill=WHITE)
 
@@ -449,11 +466,16 @@ def build_screen(state: dict) -> Image.Image:
     t_ext = as_float((state or {}).get("temp_ext_c"))
     h_ext = as_float((state or {}).get("hum_ext_pct"))
     t_cpu = as_float((state or {}).get("cpu_temp_c"))
+    cpu_load = as_float((state or {}).get("cpu_load_pct"))
+
+    # CPU shows temp + load
+    cpu_temp_txt = fmt_1(t_cpu, " C")
+    cpu_load_txt = fmt_pct0(cpu_load)
 
     rows = [
         ("INT TEMP", fmt_1(t_int, " C"), fmt_1(h_int, " %"), color_for_temp_c(t_int), color_for_hum_pct(h_int)),
         ("EXT TEMP", fmt_1(t_ext, " C"), fmt_1(h_ext, " %"), color_for_temp_c(t_ext), color_for_hum_pct(h_ext)),
-        ("CPU TEMP", fmt_1(t_cpu, " C"), None,              color_for_temp_c(t_cpu), WHITE),
+        ("CPU TEMP", cpu_temp_txt, cpu_load_txt, color_for_temp_c(t_cpu), WHITE),
     ]
 
     # Onderste regel: cooldown OF uptime
@@ -461,7 +483,6 @@ def build_screen(state: dict) -> Image.Image:
         rows.append(("COOLDOWN", f"{cooldown:02d} s", None, WHITE, WHITE))
     else:
         uptime_text = (state or {}).get("uptime_text") or "—"
-        # We doen dit als “label + value” (geen humidity kolom)
         rows.append(("UPTIME", uptime_text, None, WHITE, WHITE))
 
     # Measurements directly under status block
@@ -478,7 +499,6 @@ def build_screen(state: dict) -> Image.Image:
             x += int(d.textlength(text, font=font))
 
     for label, v1, v2, col_v1, col_v2 in rows:
-        # Uptime regel expliciet font 23
         use_font = font_uptime if label == "UPTIME" else font_meas
 
         if v2 is None:

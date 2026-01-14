@@ -1389,6 +1389,100 @@ def api_admin_alarm_set():
 # ======================================================
 # REPEATER API
 # ======================================================
+
+
+# ------------------------------
+# CPU load % (lightweight, cached)
+# ------------------------------
+_CPU_STAT_LAST = {"t": 0.0, "idle": None, "total": None, "pct": None}
+
+def cpu_load_percent_cached(min_interval_s: float = 1.0):
+    """
+    Returns CPU load percentage (0..100) based on /proc/stat deltas.
+    Cached to avoid overhead when /api/state is polled frequently.
+    """
+    now = time.time()
+    if _CPU_STAT_LAST["pct"] is not None and (now - _CPU_STAT_LAST["t"]) < min_interval_s:
+        return _CPU_STAT_LAST["pct"]
+
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            line = f.readline().strip()
+        # cpu  user nice system idle iowait irq softirq steal guest guest_nice
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "cpu":
+            return _CPU_STAT_LAST["pct"]
+
+        nums = [int(x) for x in parts[1:]]
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+
+        prev_idle = _CPU_STAT_LAST["idle"]
+        prev_total = _CPU_STAT_LAST["total"]
+
+        _CPU_STAT_LAST["idle"] = idle
+        _CPU_STAT_LAST["total"] = total
+        _CPU_STAT_LAST["t"] = now
+
+        if prev_idle is None or prev_total is None:
+            # first sample; need a second sample for a delta
+            return _CPU_STAT_LAST["pct"]
+
+        didle = idle - prev_idle
+        dtotal = total - prev_total
+        if dtotal <= 0:
+            return _CPU_STAT_LAST["pct"]
+
+        usage = 1.0 - (didle / float(dtotal))
+        pct = max(0.0, min(100.0, usage * 100.0))
+        _CPU_STAT_LAST["pct"] = pct
+        return pct
+    except Exception:
+        return _CPU_STAT_LAST["pct"]
+
+
+# ------------------------------
+# Uplink label (WLAN0 / ETH0 / HAMNET), cached
+# ------------------------------
+_UPLINK_LAST = {"t": 0.0, "label": None}
+
+def uplink_label_cached(wan_ip: str, min_interval_s: float = 5.0) -> str:
+    """
+    Best effort uplink label:
+      - If WAN is 44.* => HAMNET
+      - else based on default route dev => WLAN0/ETH0/<dev>
+    Cached to keep /api/state cheap.
+    """
+    now = time.time()
+    if _UPLINK_LAST["label"] and (now - _UPLINK_LAST["t"]) < min_interval_s:
+        return _UPLINK_LAST["label"]
+
+    label = "WAN"
+    try:
+        if isinstance(wan_ip, str) and wan_ip.strip().startswith("44."):
+            label = "HAMNET"
+        else:
+            out = subprocess.check_output(["ip", "route", "show", "default"], text=True, timeout=0.5)
+            # typical: "default via 192.168.2.1 dev wlan0 proto dhcp src ... metric ..."
+            dev = None
+            for tok_i, tok in enumerate(out.split()):
+                if tok == "dev" and tok_i + 1 < len(out.split()):
+                    dev = out.split()[tok_i + 1]
+                    break
+            if dev:
+                if dev.lower().startswith("wlan"):
+                    label = dev.upper()  # WLAN0
+                elif dev.lower().startswith("eth"):
+                    label = dev.upper()  # ETH0
+                else:
+                    label = dev
+    except Exception:
+        pass
+
+    _UPLINK_LAST["label"] = label
+    _UPLINK_LAST["t"] = now
+    return label
+    
 @app.get("/api/state")
 def api_state():
     enabled = setting_get("alarm_enabled", "1") == "1"
@@ -1405,9 +1499,23 @@ def api_state():
     lan = get_lan_ip()
     wan = get_wan_ip()
 
+    # NEW: uplink label + cpu load %
+    uplink = uplink_label_cached(wan)
+    cpu_load = cpu_load_percent_cached()
+
     cpu = read_monitor_latest(SRC_CPU)
     it = read_monitor_latest(SRC_INT)
     ex = read_monitor_latest(SRC_EXT)
+
+    # NEW: attach cpu_load into cpu monitor dict (if dict)
+    try:
+        if cpu is None:
+            cpu = {}
+        if isinstance(cpu, dict):
+            # keep it small; percent as float (e.g. 18.3)
+            cpu["load"] = cpu_load
+    except Exception:
+        pass
 
     with _STATE_LOCK:
         rep = bool(STATE["repeater_on"])
@@ -1420,6 +1528,7 @@ def api_state():
 
         "lan_ip": lan,
         "wan_ip": wan,
+        "wan_uplink": uplink,   # NEW
         "band": band,
 
         "monitor": {

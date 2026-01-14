@@ -1,11 +1,13 @@
 <!--
   Bestandsnaam : /var/www/pi3twe/index.html
-  Gegenereerd  : 2026-01-06 (Europe/Amsterdam)
+  Gegenereerd  : 2026-01-14 (Europe/Amsterdam)
   Beschrijving : PI3TWE Controller UI (Bootstrap 5, dark mode, responsive)
                  - Info / Repeater / Sensors + Log
                  - Login/Logout + 2FA setup/enable + Wachtwoord wijzigen
                  - Admin: users list/create/deactivate/activate + SUPERADMIN: hard delete + Alarm settings
                  - Fail2ban bans in Info card (LAN/WAN + Bans)
+                 - NEW: CPU Load (%) onder CPU TEMP
+                 - NEW: WAN uplink label (wan_uplink) zichtbaar als "WLAN0 | <ip>"
 
   API:
   - GET  /api/me
@@ -185,7 +187,6 @@
             <button id="btnMonitor" class="btn btn-outline-light btn-sm" style="display: none" onclick="window.location.href='/monitor/';">
               <i class="bi bi-graph-up me-1"></i>Monitor
             </button>
-
           </div>
         </div>
       </div>
@@ -287,6 +288,12 @@
             <div class="kv-row">
               <div class="k">CPU TEMP</div>
               <div class="v mono"><span id="cpuTemp">--.-</span> <span class="muted">°C</span></div>
+            </div>
+
+            <!-- NEW: CPU load -->
+            <div class="kv-row mt-1">
+              <div class="k">CPU LOAD</div>
+              <div class="v mono"><span id="cpuLoad">--</span> <span class="muted">%</span></div>
             </div>
 
             <div class="small muted mt-2 mono" id="sensorErr" style="display: none"></div>
@@ -611,6 +618,7 @@
       const elExtTemp = document.getElementById("extTemp");
       const elExtHum  = document.getElementById("extHum");
       const elCpuTemp = document.getElementById("cpuTemp");
+      const elCpuLoad = document.getElementById("cpuLoad"); // NEW
       const elSensorErr = document.getElementById("sensorErr");
 
       const elLogBox = document.getElementById("logBox");
@@ -622,9 +630,9 @@
       const btn2faOpen = document.getElementById("btn2faOpen");
       const btnPwOpen = document.getElementById("btnPwOpen");
       const btnAdminOpen = document.getElementById("btnAdminOpen");
+      const btnMonitor = document.getElementById("btnMonitor");
 
-            const btnMonitor = document.getElementById("btnMonitor");
-const usersBox = document.getElementById("usersBox");
+      const usersBox = document.getElementById("usersBox");
       const usersMsg = document.getElementById("usersMsg");
       const btnNewUserOpen = document.getElementById("btnNewUserOpen");
       const alarmEnabled = document.getElementById("alarmEnabled");
@@ -750,8 +758,8 @@ const usersBox = document.getElementById("usersBox");
           btn2faOpen.style.display = "none";
           btnPwOpen.style.display = "none";
           btnAdminOpen.style.display = "none";
-                    btnMonitor.style.display = "none";
-return;
+          btnMonitor.style.display = "none";
+          return;
         }
 
         elWho.innerHTML =
@@ -763,8 +771,8 @@ return;
         btn2faOpen.style.display = "";
         btnPwOpen.style.display = "";
         btnAdminOpen.style.display = me.is_admin ? "" : "none";
-              btnMonitor.style.display = "";
-}
+        btnMonitor.style.display = "";
+      }
 
       function setFail2banUI(total, jails, errMsg) {
         if (typeof total === "number" && isFinite(total)) elBanTotal.textContent = String(total);
@@ -817,8 +825,11 @@ return;
 
           const lan = (typeof st.lan_ip === "string" && st.lan_ip.trim()) ? st.lan_ip.trim() : "--";
           const wan = (typeof st.wan_ip === "string" && st.wan_ip.trim()) ? st.wan_ip.trim() : "--";
+          const upl = (typeof st.wan_uplink === "string" && st.wan_uplink.trim()) ? st.wan_uplink.trim() : "";
+
           elLan.textContent = lan;
-          elWan.textContent = wan;
+          // NEW: toon "WLAN0 | 88.x.x.x" (of HAMNET/ETH0)
+          elWan.textContent = upl ? `${upl} | ${wan}` : wan;
 
           setNum(elIntTemp, st.monitor?.int?.temp, 1, "--.-");
           setNum(elIntHum,  st.monitor?.int?.hum,  0, "--");
@@ -827,6 +838,11 @@ return;
           setNum(elExtHum,  st.monitor?.ext?.hum,  0, "--");
 
           setNum(elCpuTemp, st.monitor?.cpu?.temp, 1, "--.-");
+
+          // NEW: CPU load (%)
+          const cpuLoad = st.monitor?.cpu?.load;
+          if (typeof cpuLoad === "number" && isFinite(cpuLoad)) elCpuLoad.textContent = String(Math.round(cpuLoad));
+          else elCpuLoad.textContent = "--";
 
           if (st.sensor_err) {
             elSensorErr.style.display = "";

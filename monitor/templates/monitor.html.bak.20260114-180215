@@ -147,7 +147,6 @@ Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT).
   <h1>Temperatuur / Humidity Monitor</h1>
 
   <div class="toolbar">
-      <a href="/" class="btnlink">← Terug</a>
     <div class="left">
       Laatste
       <input id="hours" type="number" min="1" max="168" value="24">
