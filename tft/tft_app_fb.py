@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-14 19:00 (Europe/Amsterdam)
+# Generated   : 2026-01-13  (Europe/Amsterdam)
+# Updated     : 2026-01-14  (Europe/Amsterdam)
 # Description :
 #   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #
 #   Reads backend:
 #     GET  {PI3TWE_BACKEND}/api/state
 #
-#   Screen:
-#   - Clock top-right with seconds (always updates)
-#   - WAN line centered: "<UPLINK> | WAN IP: x.x.x.x"
+#   Screen (ACTIVE):
+#   - Clock top-right with seconds
+#   - Network line centered: "<IFACE> | WAN IP: <ip>"  (HAMNET if WAN in 44/8)
 #   - Repeater status centered (AAN=BRIGHT RED block, UIT=blue block)
-#   - Measurements directly under the repeater status block:
-#       INT/EXT/CPU (+ COOLDOWN if >0, else UPTIME on bottom row)
-#     CPU line includes CPU load % when provided by backend.
-#   - Stale handling: if no valid payload for >10s -> placeholders
-#   - Logging to /var/log/pi3twe/tft.log
+#   - Measurements:
+#       INT/EXT/CPU (+ CPU LOAD% after CPU TEMP)
+#       + COOLDOWN if >0, else UPTIME on bottom row
 #
-#   Power management (requested):
-#   - On any user action (web command or button), TFT screen turns ON
-#   - After 5 minutes (300s) without further user action, TFT turns OFF
-#   - Uses /sys/class/backlight/* when available; otherwise keeps drawing but cannot
-#     physically switch off backlight (logs a warning).
+#   Idle / Standby:
+#   - Based on backend last_user_action_age_s (if present)
+#   - Last 5 seconds before standby shows: "TFT SCREEN IN STAND BY (Ns)" on bottom row
+#   - TRUE standby: stop redraw + stop framebuffer writes (keeps last frame frozen)
+#     and only poll backend every STANDBY_POLL_S seconds (big CPU reduction).
 #
-#   Color rules:
-#   - Repeater ON: bright red
-#   - Temp thresholds: green <=70.0, orange <=80.0, red >80.0
+#   Stale handling:
+#   - If no valid payload for >10s -> placeholders (but uptime/cpu-load local continue)
+#
+#   Logging:
+#   - /var/log/pi3twe/tft.log
 # =============================================================================
 
 from __future__ import annotations
@@ -39,8 +40,10 @@ import fcntl
 import struct
 import signal
 import urllib.request
+import subprocess
+import re
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional, Any, Tuple
 
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
 
@@ -53,13 +56,26 @@ BACKEND_BASE = os.environ.get("PI3TWE_BACKEND", "http://127.0.0.1:3000")
 W = 480
 H = 320
 
+# Backend poll interval (seconds)
 REFRESH_S = float(os.environ.get("PI3TWE_TFT_REFRESH", "1.0"))
 HTTP_TIMEOUT_S = float(os.environ.get("PI3TWE_TFT_HTTP_TIMEOUT", "2.0"))
 
 LOGFILE = os.environ.get("PI3TWE_TFT_LOG", "/var/log/pi3twe/tft.log")
 
-# Inactivity timeout (seconds)
+# Inactivity timeout (seconds) -> standby
 INACTIVITY_OFF_S = float(os.environ.get("PI3TWE_TFT_IDLE_OFF_S", "300"))
+
+# While ACTIVE: redraw cadence (seconds). 1.0 keeps seconds clock live.
+DRAW_ACTIVE_S = float(os.environ.get("PI3TWE_TFT_DRAW_ACTIVE_S", "1.0"))
+
+# While STANDBY: poll backend infrequently (seconds)
+STANDBY_POLL_S = float(os.environ.get("PI3TWE_TFT_STANDBY_POLL_S", "5.0"))
+
+# Countdown seconds shown before standby
+STANDBY_COUNTDOWN_S = 5
+
+# Interface label cache
+IFACE_CACHE_S = float(os.environ.get("PI3TWE_TFT_IFACE_CACHE_S", "15.0"))
 
 # Layout
 PAD = 16
@@ -114,7 +130,7 @@ def pick_font(path: str, size: int) -> ImageFont.ImageFont:
 
 def http_get_json(url: str, timeout: float) -> Optional[dict]:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.4"})
+        req = urllib.request.Request(url, headers={"User-Agent": "pi3twe-tft/2.5"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
     except Exception as e:
@@ -140,16 +156,7 @@ def fmt_1(v: Optional[float], suffix: str = "") -> str:
         return "--.-" + suffix
 
 
-def fmt_pct0(v: Optional[float]) -> str:
-    if v is None:
-        return "--%"
-    try:
-        return f"{int(round(float(v)))}%"
-    except Exception:
-        return "--%"
-
-
-def color_for_temp_c(v: Optional[float]) -> tuple[int, int, int]:
+def color_for_temp_c(v: Optional[float]) -> Tuple[int, int, int]:
     if v is None:
         return WHITE
     if v <= 70.0:
@@ -159,7 +166,7 @@ def color_for_temp_c(v: Optional[float]) -> tuple[int, int, int]:
     return RED_BAD
 
 
-def color_for_hum_pct(v: Optional[float]) -> tuple[int, int, int]:
+def color_for_hum_pct(v: Optional[float]) -> Tuple[int, int, int]:
     if v is None:
         return WHITE
     if v < 60.0:
@@ -170,10 +177,6 @@ def color_for_hum_pct(v: Optional[float]) -> tuple[int, int, int]:
 
 
 def read_uptime_seconds() -> Optional[int]:
-    """
-    Read system uptime from /proc/uptime.
-    Returns seconds (int) or None on error.
-    """
     try:
         with open("/proc/uptime", "r", encoding="utf-8") as f:
             txt = f.read().strip().split()
@@ -198,10 +201,99 @@ def format_uptime(secs: Optional[int]) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+# ------------------------------ CPU Load % (local) ---------------------------
+
+def _read_proc_stat_cpu() -> Optional[Tuple[int, int]]:
+    """
+    Returns (total_jiffies, idle_jiffies) for aggregate CPU line.
+    """
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            line = f.readline()
+        if not line.startswith("cpu "):
+            return None
+        parts = line.strip().split()
+        nums = [int(x) for x in parts[1:]]
+        if len(nums) < 4:
+            return None
+        user, nice, system, idle = nums[0], nums[1], nums[2], nums[3]
+        iowait = nums[4] if len(nums) > 4 else 0
+        irq = nums[5] if len(nums) > 5 else 0
+        softirq = nums[6] if len(nums) > 6 else 0
+        steal = nums[7] if len(nums) > 7 else 0
+        total = user + nice + system + idle + iowait + irq + softirq + steal
+        idle_all = idle + iowait
+        return total, idle_all
+    except Exception:
+        return None
+
+
+def cpu_load_percent(prev: Optional[Tuple[int, int]], cur: Optional[Tuple[int, int]]) -> Optional[float]:
+    if not prev or not cur:
+        return None
+    prev_total, prev_idle = prev
+    cur_total, cur_idle = cur
+    dt = cur_total - prev_total
+    di = cur_idle - prev_idle
+    if dt <= 0:
+        return None
+    busy = dt - di
+    pct = 100.0 * (busy / float(dt))
+    if pct < 0.0:
+        pct = 0.0
+    if pct > 100.0:
+        pct = 100.0
+    return pct
+
+
+# ------------------------------ Network iface label (local) ------------------
+
+_RE_DEV = re.compile(r"\bdev\s+([a-zA-Z0-9_.:-]+)\b")
+
+def _route_dev_for_target(target: str) -> Optional[str]:
+    """
+    Best effort: ask kernel routing which dev would be used.
+    """
+    try:
+        # ip is usually in /sbin or /usr/sbin
+        cmd = ["ip", "route", "get", target]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1.0)
+        if r.returncode != 0:
+            return None
+        m = _RE_DEV.search(r.stdout)
+        if not m:
+            return None
+        return m.group(1)
+    except Exception:
+        return None
+
+
+def _iface_label_from_dev(dev: Optional[str]) -> str:
+    if not dev:
+        return "WAN"
+    d = dev.lower()
+    if d == "wlan0":
+        return "WLAN0"
+    if d == "eth0":
+        return "ETH0"
+    return dev.upper()
+
+
+def decide_wan_iface_label(wan_ip: str) -> str:
+    wan_ip = (wan_ip or "").strip()
+    if wan_ip.startswith("44."):
+        return "HAMNET"
+    # Default internet route device (works for normal WAN)
+    dev = _route_dev_for_target("1.1.1.1")
+    return _iface_label_from_dev(dev)
+
+
+# ------------------------------ State parsing --------------------------------
+
 def placeholder_state() -> dict:
     return {
         "ip_external": "—",
-        "uplink": "WAN",
+        "wan_iface": "WAN",
         "repeater": False,
         "cooldown": 0,
         "temp_int_c": None,
@@ -209,7 +301,7 @@ def placeholder_state() -> dict:
         "temp_ext_c": None,
         "hum_ext_pct": None,
         "cpu_temp_c": None,
-        "cpu_load_pct": None,
+        "cpu_load_pct": None,  # local computed
         # power mgmt
         "last_user_action_ts": None,
         "last_user_action_age_s": None,
@@ -227,10 +319,6 @@ def parse_api_state(payload: dict) -> dict:
         wan = (payload.get("wan_ip") or "").strip()
         out["ip_external"] = wan if wan else "—"
 
-        upl = (payload.get("wan_uplink") or "").strip()
-        out["uplink"] = upl if upl else "WAN"
-
-        # power mgmt fields from backend
         out["last_user_action_ts"] = payload.get("last_user_action_ts")
         out["last_user_action_age_s"] = payload.get("last_user_action_age_s")
 
@@ -249,100 +337,9 @@ def parse_api_state(payload: dict) -> dict:
 
         if isinstance(cpu, dict):
             out["cpu_temp_c"] = as_float(cpu.get("temp"))
-            out["cpu_load_pct"] = as_float(cpu.get("load"))
     except Exception as e:
         log(f"PARSE ERROR: {type(e).__name__}: {e}")
     return out
-
-
-# ------------------------------ Backlight control ----------------------------
-
-class BacklightController:
-    """
-    Best effort backlight control using /sys/class/backlight/*
-    """
-
-    def __init__(self) -> None:
-        self.brightness_path: Optional[str] = None
-        self.bl_power_path: Optional[str] = None
-        self.max_brightness: Optional[int] = None
-        self._is_on: Optional[bool] = None
-        self._discover()
-
-    def _discover(self) -> None:
-        base = "/sys/class/backlight"
-        try:
-            if not os.path.isdir(base):
-                log("BACKLIGHT: /sys/class/backlight not present; cannot control backlight.")
-                return
-            entries = sorted(os.listdir(base))
-            for name in entries:
-                d = os.path.join(base, name)
-                bp = os.path.join(d, "brightness")
-                mp = os.path.join(d, "max_brightness")
-                pp = os.path.join(d, "bl_power")
-                if os.path.isfile(bp):
-                    self.brightness_path = bp
-                    if os.path.isfile(mp):
-                        try:
-                            with open(mp, "r", encoding="utf-8") as f:
-                                self.max_brightness = int(f.read().strip() or "0") or None
-                        except Exception:
-                            self.max_brightness = None
-                    if os.path.isfile(pp):
-                        self.bl_power_path = pp
-                    log(f"BACKLIGHT: using {d} (brightness={bool(self.brightness_path)} bl_power={bool(self.bl_power_path)} max={self.max_brightness})")
-                    return
-
-            log("BACKLIGHT: no usable backlight entries found under /sys/class/backlight.")
-        except Exception as e:
-            log(f"BACKLIGHT: discovery error: {type(e).__name__}: {e}")
-
-    def _write_sysfs(self, path: str, value: str) -> bool:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(value)
-            return True
-        except Exception as e:
-            log(f"BACKLIGHT: write failed {path}={value!r}: {type(e).__name__}: {e}")
-            return False
-
-    def on(self) -> None:
-        if self._is_on is True:
-            return
-        ok = False
-
-        if self.bl_power_path:
-            ok = self._write_sysfs(self.bl_power_path, "0")
-
-        if self.brightness_path:
-            if self.max_brightness and self.max_brightness > 0:
-                val = str(self.max_brightness)
-            else:
-                val = "255"
-            ok2 = self._write_sysfs(self.brightness_path, val)
-            ok = ok or ok2
-
-        if ok:
-            self._is_on = True
-
-    def off(self) -> None:
-        if self._is_on is False:
-            return
-        ok = False
-
-        if self.bl_power_path:
-            ok = self._write_sysfs(self.bl_power_path, "4")
-
-        if self.brightness_path:
-            ok2 = self._write_sysfs(self.brightness_path, "0")
-            ok = ok or ok2
-
-        if ok:
-            self._is_on = False
-
-    def is_supported(self) -> bool:
-        return bool(self.brightness_path or self.bl_power_path)
 
 
 # ------------------------------ Framebuffer ---------------------------------
@@ -410,19 +407,22 @@ def image_to_rgb565(im: Image.Image) -> bytes:
 
 # ------------------------------ UI ------------------------------------------
 
-def build_screen(state: dict) -> Image.Image:
+def build_screen(state: dict, standby_countdown: Optional[int]) -> Image.Image:
+    """
+    standby_countdown:
+      None -> normal screen
+      int  -> show "TFT SCREEN IN STAND BY (Ns)" on bottom row (N seconds left)
+    """
     im = Image.new("RGB", (W, H), BLACK)
     d = ImageDraw.Draw(im)
 
     font_h = pick_font(FONT_BOLD, 30)
     font_r = pick_font(FONT_BOLD, 36)
 
-    # WAN font iets kleiner (ruimte bij lange IPs)
-    font_wan = pick_font(FONT_REG, 23)
+    # Net-line font
+    font_net = pick_font(FONT_REG, 24)
 
     font_meas = pick_font(FONT_BOLD, 24)
-
-    # Uptime-regel: expliciet font size 23
     font_uptime = pick_font(FONT_BOLD, 23)
 
     # Title
@@ -433,12 +433,12 @@ def build_screen(state: dict) -> Image.Image:
     tw = d.textlength(clk, font=font_h)
     d.text((W - PAD - int(tw), HEADER_Y), clk, font=font_h, fill=WHITE)
 
-    # WAN IP line: "<UPLINK> | WAN IP: x.x.x.x"
-    uplink = (state or {}).get("uplink") or "WAN"
+    # Network line: "<IFACE> | WAN IP: <ip>"
     wan = (state or {}).get("ip_external") or "—"
-    wan_line = f"{uplink} | WAN IP: {wan}"
-    wtw = d.textlength(wan_line, font=font_wan)
-    d.text(((W - int(wtw)) // 2, HEADER_Y + 44), wan_line, font=font_wan, fill=WHITE)
+    iface = (state or {}).get("wan_iface") or "WAN"
+    net_line = f"{iface} | WAN IP: {wan}"
+    wtw = d.textlength(net_line, font=font_net)
+    d.text(((W - int(wtw)) // 2, HEADER_Y + 44), net_line, font=font_net, fill=WHITE)
 
     # Repeater block
     rep = bool((state or {}).get("repeater", False))
@@ -466,30 +466,30 @@ def build_screen(state: dict) -> Image.Image:
     t_ext = as_float((state or {}).get("temp_ext_c"))
     h_ext = as_float((state or {}).get("hum_ext_pct"))
     t_cpu = as_float((state or {}).get("cpu_temp_c"))
-    cpu_load = as_float((state or {}).get("cpu_load_pct"))
 
-    # CPU shows temp + load
-    cpu_temp_txt = fmt_1(t_cpu, " C")
-    cpu_load_txt = fmt_pct0(cpu_load)
+    cpu_load = (state or {}).get("cpu_load_pct")
+    cpu_load_txt = "--%" if cpu_load is None else f"{int(round(float(cpu_load))):d}%"
 
     rows = [
         ("INT TEMP", fmt_1(t_int, " C"), fmt_1(h_int, " %"), color_for_temp_c(t_int), color_for_hum_pct(h_int)),
         ("EXT TEMP", fmt_1(t_ext, " C"), fmt_1(h_ext, " %"), color_for_temp_c(t_ext), color_for_hum_pct(h_ext)),
-        ("CPU TEMP", cpu_temp_txt, cpu_load_txt, color_for_temp_c(t_cpu), WHITE),
+        ("CPU TEMP", fmt_1(t_cpu, " C"), f"LOAD {cpu_load_txt}", color_for_temp_c(t_cpu), WHITE),
     ]
 
-    # Onderste regel: cooldown OF uptime
-    if cooldown > 0:
+    # Bottom row: countdown OR cooldown OR uptime
+    if standby_countdown is not None:
+        rows.append(("TFT", f"SCREEN IN STAND BY ({standby_countdown}s)", None, WHITE, WHITE))
+    elif cooldown > 0:
         rows.append(("COOLDOWN", f"{cooldown:02d} s", None, WHITE, WHITE))
     else:
         uptime_text = (state or {}).get("uptime_text") or "—"
         rows.append(("UPTIME", uptime_text, None, WHITE, WHITE))
 
-    # Measurements directly under status block
+    # Measurements under status block
     line_h = 32
     y = ry + block_h + 14
 
-    def draw_centered_segments(ypos: int, segments: list[tuple[str, tuple[int, int, int]]], font: ImageFont.ImageFont) -> None:
+    def draw_centered_segments(ypos: int, segments: list[tuple[str, Tuple[int, int, int]]], font: ImageFont.ImageFont) -> None:
         total_w = 0.0
         for text, _col in segments:
             total_w += d.textlength(text, font=font)
@@ -499,13 +499,11 @@ def build_screen(state: dict) -> Image.Image:
             x += int(d.textlength(text, font=font))
 
     for label, v1, v2, col_v1, col_v2 in rows:
-        use_font = font_uptime if label == "UPTIME" else font_meas
-
+        use_font = font_uptime if label in ("UPTIME", "TFT") else font_meas
         if v2 is None:
             segments = [(f"{label}: ", WHITE), (v1, col_v1)]
         else:
             segments = [(f"{label}: ", WHITE), (v1, col_v1), ("   ", WHITE), (v2, col_v2)]
-
         draw_centered_segments(y, segments, use_font)
         y += line_h
 
@@ -526,94 +524,137 @@ signal.signal(signal.SIGINT, _sig)
 signal.signal(signal.SIGTERM, _sig)
 
 
-def should_screen_be_on(state: dict, last_ok: float) -> bool:
-    """
-    Decide ON/OFF based on backend last_user_action_age_s.
-    - If backend provides age: ON when age <= INACTIVITY_OFF_S
-    - If no age provided yet: keep ON (avoid accidental blank)
-    - If stale backend >10s: keep current behavior (handled by caller)
-    """
+def _activity_age_s(state: dict) -> Optional[float]:
     age = (state or {}).get("last_user_action_age_s")
+    if age is None:
+        return None
     try:
-        if age is None:
-            return True
-        return float(age) <= float(INACTIVITY_OFF_S)
+        return float(age)
     except Exception:
+        return None
+
+
+def _standby_countdown(age_s: Optional[float]) -> Optional[int]:
+    if age_s is None:
+        return None
+    remaining = int(round(INACTIVITY_OFF_S - age_s))
+    if 1 <= remaining <= STANDBY_COUNTDOWN_S:
+        return remaining
+    return None
+
+
+def _should_be_active(age_s: Optional[float]) -> bool:
+    if age_s is None:
         return True
+    return age_s <= INACTIVITY_OFF_S
 
 
 def main() -> int:
     fb = Framebuffer(FB)
-    bl = BacklightController()
 
     state: dict = placeholder_state()
     last_fetch = 0.0
     last_ok = 0.0
 
-    screen_on = True
-    bl.on()
+    # CPU load sampling
+    prev_stat = _read_proc_stat_cpu()
+    last_cpu_sample = time.time()
 
-    log(f"START backend={BACKEND_BASE} refresh={REFRESH_S}s timeout={HTTP_TIMEOUT_S}s fb={FB} idle_off={INACTIVITY_OFF_S}s backlight_supported={bl.is_supported()}")
+    # Interface label caching
+    last_iface_check = 0.0
+    cached_iface = "WAN"
+    cached_wan = ""
+
+    # Active/standby control
+    active = True
+    last_draw = 0.0
+
+    log(
+        "START "
+        f"backend={BACKEND_BASE} refresh={REFRESH_S}s timeout={HTTP_TIMEOUT_S}s fb={FB} "
+        f"idle_off={INACTIVITY_OFF_S}s draw_active={DRAW_ACTIVE_S}s standby_poll={STANDBY_POLL_S}s "
+        f"iface_cache={IFACE_CACHE_S}s"
+    )
 
     try:
         while RUN:
             now = time.time()
 
-            # Altijd lokale uptime updaten (ook als backend stale is)
+            # Local uptime always available
             up_s = read_uptime_seconds()
-            up_txt = format_uptime(up_s)
-            state["uptime_text"] = up_txt
+            state["uptime_text"] = format_uptime(up_s)
 
-            # Fetch (throttled)
-            if (now - last_fetch) >= REFRESH_S:
+            # Local CPU load % (sample about once per second)
+            if (now - last_cpu_sample) >= 1.0:
+                cur_stat = _read_proc_stat_cpu()
+                pct = cpu_load_percent(prev_stat, cur_stat)
+                state["cpu_load_pct"] = pct
+                prev_stat = cur_stat
+                last_cpu_sample = now
+
+            # Backend fetch cadence differs in ACTIVE vs STANDBY
+            fetch_interval = REFRESH_S if active else STANDBY_POLL_S
+
+            if (now - last_fetch) >= fetch_interval:
                 payload = http_get_json(f"{BACKEND_BASE}/api/state", timeout=HTTP_TIMEOUT_S)
                 if isinstance(payload, dict) and payload.get("repeater") is not None:
                     state_new = parse_api_state(payload)
-                    # behoud lokaal berekende uptime
-                    state_new["uptime_text"] = up_txt
+
+                    # preserve locals
+                    state_new["uptime_text"] = state["uptime_text"]
+                    state_new["cpu_load_pct"] = state.get("cpu_load_pct")
+
                     state = state_new
                     last_ok = now
                 else:
-                    # Stale handling
                     if (now - last_ok) > 10.0:
                         st = placeholder_state()
-                        st["uptime_text"] = up_txt
+                        st["uptime_text"] = state["uptime_text"]
+                        st["cpu_load_pct"] = state.get("cpu_load_pct")
+                        # keep last iface label
+                        st["wan_iface"] = state.get("wan_iface") or cached_iface
                         state = st
                         log("TFT state stale >10s, reset placeholders")
 
                 last_fetch = now
 
-            # Power management decision
-            desired_on = True
+            # Update iface label (cached, best effort)
+            wan_now = (state.get("ip_external") or "").strip()
+            if (wan_now != cached_wan) or ((now - last_iface_check) >= IFACE_CACHE_S):
+                cached_wan = wan_now
+                cached_iface = decide_wan_iface_label(wan_now)
+                last_iface_check = now
+                state["wan_iface"] = cached_iface
+
+            # Decide ACTIVE vs STANDBY (only if backend not stale)
             if (now - last_ok) <= 10.0:
-                desired_on = should_screen_be_on(state, last_ok)
+                age = _activity_age_s(state)
+                desired_active = _should_be_active(age)
             else:
-                # backend stale; keep current (avoid flicker/blackout due to missing data)
-                desired_on = screen_on
+                desired_active = active
 
-            if desired_on != screen_on:
-                screen_on = desired_on
-                if screen_on:
-                    bl.on()
-                    log("SCREEN: ON (activity detected or within timeout)")
+            if desired_active != active:
+                active = desired_active
+                if active:
+                    log("MODE: ACTIVE (activity detected)")
+                    last_draw = 0.0
                 else:
-                    bl.off()
-                    log("SCREEN: OFF (idle timeout reached)")
+                    log("MODE: STANDBY (idle timeout reached)")
 
-            # Drawing
-            if screen_on:
-                img = build_screen(state)
+            # Drawing & framebuffer writes:
+            if active:
+                if (now - last_draw) >= DRAW_ACTIVE_S:
+                    age = _activity_age_s(state) if (now - last_ok) <= 10.0 else None
+                    countdown = _standby_countdown(age)
+                    img = build_screen(state, countdown)
+                    fb.blit(image_to_rgb565(img))
+                    last_draw = now
+                time.sleep(0.05)
             else:
-                img = Image.new("RGB", (W, H), BLACK)
-
-            fb.blit(image_to_rgb565(img))
-            time.sleep(0.05)
+                # standby: intentionally no draw/no blit -> minimal CPU
+                time.sleep(0.20)
 
     finally:
-        try:
-            bl.on()
-        except Exception:
-            pass
         fb.close()
         log("EXIT")
 
