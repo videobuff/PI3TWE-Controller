@@ -1,0 +1,341 @@
+<!--
+============================================================================
+File     : monitor.html
+Updated  : 2026-01-16 (Europe/Amsterdam)
+Description: Donker dashboard met 3 grafiekkaarten (CPU / INT / EXT) + CPU-load tabel.
+============================================================================
+-->
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PI3TWE Monitor</title>
+
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  
+
+<!-- date-fns -->
+<script src="https://cdn.jsdelivr.net/npm/date-fns@3"></script>
+
+<!-- Chart.js date adapter -->
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+
+<!-- jouw eigen JS -->
+
+
+  <style>
+    :root{
+      --bg: #0b0e14;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.04);
+      --line: rgba(255,255,255,0.08);
+      --text: rgba(255,255,255,0.88);
+      --muted: rgba(255,255,255,0.55);
+      --accent: #4da3ff;
+      --btn: rgba(77,163,255,0.18);
+      --btn2: rgba(77,163,255,0.26);
+      --ok: #2bd4a6;
+      --warn: #ffcc66;
+    }
+
+    html, body { height: 100%; }
+    body{
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 700px at 20% 10%, rgba(77,163,255,0.14), transparent 55%),
+        radial-gradient(900px 600px at 85% 20%, rgba(43,212,166,0.10), transparent 60%),
+        radial-gradient बताए
+        (1200px 900px at 60% 90%, rgba(255,204,102,0.07), transparent 55%),
+        var(--bg);
+    }
+
+    .wrap{
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 18px 18px 22px 18px;
+    }
+
+    .topbar{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .title{
+      font-weight: 800;
+      letter-spacing: 0.2px;
+      font-size: 22px;
+    }
+
+    .subtitle{
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+
+    .controls{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .chip{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+    }
+
+    .chip label{
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .chip input, .chip select{
+      background: rgba(0,0,0,0.0);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 6px 10px;
+      font-size: 12px;
+      outline: none;
+      min-width: 70px;
+    }
+
+    .btn{
+      border: 1px solid rgba(77,163,255,0.35);
+      background: var(--btn);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 12px;
+      transition: background 120ms ease;
+      user-select: none;
+    }
+    .btn:hover{ background: var(--btn2); }
+    .btn.secondary{
+      border-color: rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.06);
+    }
+
+    .status{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .dot{
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.22);
+      box-shadow: 0 0 0 4px rgba(255,255,255,0.06);
+    }
+    .dot.ok{ background: var(--ok); box-shadow: 0 0 0 4px rgba(43,212,166,0.18); }
+    .dot.warn{ background: var(--warn); box-shadow: 0 0 0 4px rgba(255,204,102,0.18); }
+
+    .grid{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 12px;
+    }
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.04));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px 14px 10px 14px;
+      box-shadow: 0 14px 45px rgba(0,0,0,0.45);
+      overflow: hidden;
+      position: relative;
+      min-height: 340px;
+    }
+
+    .card h2{
+      margin: 0 0 8px 0;
+      font-size: 14px;
+      letter-spacing: 0.2px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .now{
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 260px !important;
+    }
+
+    /* --- CPU LOAD table --- */
+    .subcard {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .subhead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0 0 8px 0;
+      font-size: 12px;
+      color: rgba(255,255,255,0.70);
+      font-weight: 700;
+    }
+
+    .subhead .hint {
+      font-weight: 600;
+      color: rgba(255,255,255,0.45);
+      font-size: 11px;
+    }
+
+    .loadtable {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+    .loadtable thead th{
+      text-align: left;
+      padding: 8px 10px;
+      background: rgba(255,255,255,0.06);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.75);
+      font-weight: 800;
+      letter-spacing: 0.15px;
+    }
+    .loadtable tbody td{
+      padding: 7px 10px;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      color: rgba(255,255,255,0.86);
+      font-variant-numeric: tabular-nums;
+    }
+    .loadtable tbody tr:last-child td{ border-bottom: none; }
+    .loadtable tbody tr:nth-child(even){ background: rgba(255,255,255,0.03); }
+
+    @media (max-width: 1100px){
+      .grid{ grid-template-columns: 1fr; }
+      .card{ min-height: 320px; }
+      canvas{ height: 240px !important; }
+    }
+
+    .footer{
+      margin-top: 10px;
+      font-size: 12px;
+      color: rgba(255,255,255,0.40);
+    }
+
+    .footer b{ color: rgba(255,255,255,0.62); }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <div class="title">Temperatuur / Humidity Monitor</div>
+        <div class="subtitle">/monitor/api/data · /monitor/api/health</div>
+      </div>
+
+      <div class="controls">
+        <a class="btn secondary" href="/">← Terug</a>
+
+        <div class="chip">
+          <label for="lastHours">Laatste</label>
+          <input id="lastHours" type="number" min="1" max="720" step="1" value="24" />
+          <label>uur</label>
+        </div>
+
+        <button class="btn" id="btnFetch">Ververs</button>
+
+        <div class="chip">
+          <label for="autoRefresh">Auto</label>
+          <select id="autoRefresh">
+            <option value="0">uit</option>
+            <option value="5">5s</option>
+            <option value="10" selected>10s</option>
+            <option value="20">20s</option>
+            <option value="30">30s</option>
+            <option value="60">60s</option>
+          </select>
+          <button class="btn" id="btnToggleAuto">Ververs</button>
+        </div>
+
+        <div class="status">
+          <span class="dot" id="dotHealth"></span>
+          <span id="healthText">—</span>
+        </div>
+
+        <a class="btn" href="/monitor/live">Live</a>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>CPU <span class="now" id="nowCpu">—</span></h2>
+        <canvas id="cpuChart"></canvas>
+
+        <!-- CPU Load tabel (gevuld door monitor.js; blijft verborgen als backend geen load levert) -->
+        <div class="subcard" id="cpuLoadWrap" style="display:none;">
+          <div class="subhead">
+            <div>CPU load (laatste metingen)</div>
+            <div class="hint">tijd · load · avg(5m)</div>
+          </div>
+          <table class="loadtable">
+            <thead>
+              <tr>
+                <th style="width: 40%;">Tijd</th>
+                <th style="width: 30%; text-align:right;">Load</th>
+                <th style="width: 30%; text-align:right;">Avg (5m)</th>
+              </tr>
+            </thead>
+            <tbody id="cpuLoadBody">
+              <!-- rows via JS -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>INT <span class="now" id="nowInt">—</span></h2>
+        <canvas id="intChart"></canvas>
+      </div>
+
+      <div class="card">
+        <h2>EXT <span class="now" id="nowExt">—</span></h2>
+        <canvas id="extChart"></canvas>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span><b>PI3TWE Monitor</b> • logging 60s • retentie 365 dagen</span>
+    </div>
+  </div>
+
+  <script src="/monitor/static/monitor.js?v=20260116-1100"></script>
+</body>
+</html>

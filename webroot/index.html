@@ -1,13 +1,13 @@
 <!--
   Bestandsnaam : /var/www/pi3twe/index.html
-  Gegenereerd  : 2026-01-14 (Europe/Amsterdam)
+  Gegenereerd  : 2026-01-15 (Europe/Amsterdam)
   Beschrijving : PI3TWE Controller UI (Bootstrap 5, dark mode, responsive)
                  - Info / Repeater / Sensors + Log
                  - Login/Logout + 2FA setup/enable + Wachtwoord wijzigen
                  - Admin: users list/create/deactivate/activate + SUPERADMIN: hard delete + Alarm settings
                  - Fail2ban bans in Info card (LAN/WAN + Bans)
-                 - NEW: CPU Load (%) onder CPU TEMP
-                 - NEW: WAN uplink label (wan_uplink) zichtbaar als "WLAN0 | <ip>"
+                 - Repeater status badge: full-width (same width as button), text = ON AIR / STAND BY
+                 - Repeater card: network label (WLAN/ETH/HAMNET) + uptime under the button
 
   API:
   - GET  /api/me
@@ -28,6 +28,10 @@
   - POST /api/admin/users/<id>/purge
   - GET  /api/admin/alarm
   - POST /api/admin/alarm
+
+  Verwacht (optioneel) in /api/state:
+  - wan_uplink: string (bv "wlan0", "eth0", "end0", "enx...")
+  - uptime_text: string (bv "2d 03:14:55") of uptime_s: number
 -->
 
 <!doctype html>
@@ -80,11 +84,17 @@
       }
       .pulse { animation: pulseGreen 1.4s infinite; }
 
+      /* Full-width status pill (same width as button) */
+      .status-pill {
+        width: 100%;
+        justify-content: center;
+        padding: 0.65rem 0.9rem;
+      }
+
       .badge-onair {
         background: rgba(25, 135, 84, 0.22);
         color: #9ff2c7;
         border: 1px solid rgba(25, 135, 84, 0.45);
-        padding: 0.55rem 0.9rem;
         border-radius: 999px;
         font-weight: 800;
         letter-spacing: 0.06em;
@@ -150,6 +160,27 @@
       .ban-row { display: flex; justify-content: space-between; font-family: var(--bs-font-monospace); font-size: 0.85rem; }
       .ban-name { opacity: 0.85; }
       .ban-count { font-weight: 600; }
+
+      /* Network label under button */
+      .netpill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.35rem 0.7rem;
+        border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.25);
+        background: rgba(0,0,0,0.55);
+        color: #fff;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+      }
+      .netdot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: #fff;
+        opacity: 0.85;
+      }
 
       /* ---------- Admin users: smaller font + tighter table ---------- */
       #usersBox .table { font-size: 0.82rem; }
@@ -239,10 +270,11 @@
               <i class="bi bi-broadcast-pin muted"></i>
             </div>
 
-            <div class="mb-3 text-center">
-              <div id="statusBadge" class="badge-onair badge-off mx-auto">
+            <div class="mb-2 text-center">
+              <!-- FULL WIDTH: same as button (w-100) -->
+              <div id="statusBadge" class="badge-onair badge-off status-pill mx-auto">
                 <span id="statusDot" class="dot dot-off"></span>
-                <span id="statusText">OFF</span>
+                <span id="statusText">STAND BY</span>
               </div>
             </div>
 
@@ -251,6 +283,16 @@
                 <i class="bi bi-power me-2"></i>
                 <span id="btnLabel">PI3TWE AAN</span>
               </button>
+
+              <!-- Network label + uptime (requested) -->
+              <div class="mt-2">
+                <span id="netPill" class="netpill">
+                  <span class="netdot"></span>
+                  <span id="netLabel">NET</span>
+                </span>
+              </div>
+              <div class="small muted mono mt-1" id="uptimeVal">uptime: --</div>
+
               <div id="cooldownHint" class="small muted mt-2" style="display: none"></div>
             </div>
           </div>
@@ -289,8 +331,6 @@
               <div class="k">CPU TEMP</div>
               <div class="v mono"><span id="cpuTemp">--.-</span> <span class="muted">°C</span></div>
             </div>
-
-            <!-- NEW: CPU load -->
             <div class="kv-row mt-1">
               <div class="k">CPU LOAD</div>
               <div class="v mono"><span id="cpuLoad">--</span> <span class="muted">%</span></div>
@@ -574,6 +614,30 @@
         else el.textContent = fallback;
       }
 
+      function formatUptimeFromSeconds(secs) {
+        if (typeof secs !== "number" || !isFinite(secs) || secs < 0) return "--";
+        secs = Math.floor(secs);
+        const days = Math.floor(secs / 86400);
+        secs %= 86400;
+        const hh = Math.floor(secs / 3600);
+        secs %= 3600;
+        const mm = Math.floor(secs / 60);
+        const ss = secs % 60;
+        if (days > 0) return `${days}d ${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+        return `${String(hh).padStart(2,"0")}:${String(mm).padStart(2,"0")}:${String(ss).padStart(2,"0")}`;
+      }
+
+      function classifyNetLabel(wanIp, uplink) {
+        const ip = (typeof wanIp === "string" ? wanIp.trim() : "");
+        if (ip.startsWith("44.")) return "HAMNET";
+        const u = (typeof uplink === "string" ? uplink.trim().toLowerCase() : "");
+        if (u.startsWith("wlan")) return "WLAN0";
+        if (u.startsWith("eth")) return "ETH0";
+        if (u.startsWith("en")) return "ETH0";   // end0 / enp* / enx*
+        if (u) return u.toUpperCase();
+        return "WAN";
+      }
+
       const API_STATE = "/api/state";
       const API_ON = "/api/repeater/on";
       const API_OFF = "/api/repeater/off";
@@ -613,12 +677,15 @@
       const elBtnLabel = document.getElementById("btnLabel");
       const elCooldownHint = document.getElementById("cooldownHint");
 
+      const elNetLabel = document.getElementById("netLabel");
+      const elUptimeVal = document.getElementById("uptimeVal");
+
       const elIntTemp = document.getElementById("intTemp");
       const elIntHum  = document.getElementById("intHum");
       const elExtTemp = document.getElementById("extTemp");
       const elExtHum  = document.getElementById("extHum");
       const elCpuTemp = document.getElementById("cpuTemp");
-      const elCpuLoad = document.getElementById("cpuLoad"); // NEW
+      const elCpuLoad = document.getElementById("cpuLoad");
       const elSensorErr = document.getElementById("sensorErr");
 
       const elLogBox = document.getElementById("logBox");
@@ -691,7 +758,7 @@
           elBtn.classList.add("btn-danger");
           elBtnLabel.textContent = "PI3TWE UIT";
         } else {
-          elStatusText.textContent = "OFF";
+          elStatusText.textContent = "STAND BY";
           elStatusBadge.classList.add("badge-off");
           elStatusDot.classList.add("dot-off");
           elStatusBadge.classList.remove("pulse");
@@ -815,6 +882,18 @@
         }
       }
 
+      function applyNetAndUptime(st) {
+        const wan = (typeof st?.wan_ip === "string" ? st.wan_ip.trim() : "");
+        const uplink = (typeof st?.wan_uplink === "string" ? st.wan_uplink.trim() : "");
+        elNetLabel.textContent = classifyNetLabel(wan, uplink);
+
+        // uptime: prefer uptime_text, else uptime_s
+        const ut = (typeof st?.uptime_text === "string" && st.uptime_text.trim()) ? st.uptime_text.trim() : "";
+        if (ut) elUptimeVal.textContent = `uptime: ${ut}`;
+        else if (typeof st?.uptime_s === "number" && isFinite(st.uptime_s)) elUptimeVal.textContent = `uptime: ${formatUptimeFromSeconds(st.uptime_s)}`;
+        else elUptimeVal.textContent = `uptime: --`;
+      }
+
       async function pollState() {
         try {
           const st = await fetchJson(API_STATE);
@@ -825,11 +904,11 @@
 
           const lan = (typeof st.lan_ip === "string" && st.lan_ip.trim()) ? st.lan_ip.trim() : "--";
           const wan = (typeof st.wan_ip === "string" && st.wan_ip.trim()) ? st.wan_ip.trim() : "--";
-          const upl = (typeof st.wan_uplink === "string" && st.wan_uplink.trim()) ? st.wan_uplink.trim() : "";
-
           elLan.textContent = lan;
-          // NEW: toon "WLAN0 | 88.x.x.x" (of HAMNET/ETH0)
-          elWan.textContent = upl ? `${upl} | ${wan}` : wan;
+          elWan.textContent = wan;
+
+          // Network label + uptime under button
+          applyNetAndUptime(st);
 
           setNum(elIntTemp, st.monitor?.int?.temp, 1, "--.-");
           setNum(elIntHum,  st.monitor?.int?.hum,  0, "--");
@@ -838,11 +917,7 @@
           setNum(elExtHum,  st.monitor?.ext?.hum,  0, "--");
 
           setNum(elCpuTemp, st.monitor?.cpu?.temp, 1, "--.-");
-
-          // NEW: CPU load (%)
-          const cpuLoad = st.monitor?.cpu?.load;
-          if (typeof cpuLoad === "number" && isFinite(cpuLoad)) elCpuLoad.textContent = String(Math.round(cpuLoad));
-          else elCpuLoad.textContent = "--";
+          setNum(elCpuLoad, st.monitor?.cpu?.load, 0, "--");
 
           if (st.sensor_err) {
             elSensorErr.style.display = "";

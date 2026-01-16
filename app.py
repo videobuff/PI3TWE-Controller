@@ -24,6 +24,7 @@
 
 from zoneinfo import ZoneInfo
 from flask import Flask, jsonify, request, abort, session
+from flask import Flask, request, session, jsonify, abort, has_request_context
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3
@@ -103,7 +104,31 @@ _MONITOR_STOP = threading.Event()
 # ---------------------
 def utc_ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+def read_uptime_seconds() -> Optional[int]:
+    try:
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            txt = f.read().strip().split()
+        if not txt:
+            return None
+        return int(float(txt[0]))
+    except Exception:
+        return None
 
+
+def format_uptime(secs: Optional[int]) -> str:
+    if secs is None or secs < 0:
+        return "—"
+    days = secs // 86400
+    rem = secs % 86400
+    h = rem // 3600
+    rem %= 3600
+    m = rem // 60
+    s = rem % 60
+    if days > 0:
+        return f"{days}d {h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
+    
 
 def ensure_parent_dir(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -134,12 +159,13 @@ def load_or_create_secret() -> str:
 
 
 def client_ip() -> str:
+    if not has_request_context():
+        return "-"
     ip = request.remote_addr
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         ip = xff.split(",")[0].strip()
     return ip or "-"
-
 
 def current_user_id():
     return session.get("uid")
@@ -1520,10 +1546,15 @@ def api_state():
     with _STATE_LOCK:
         rep = bool(STATE["repeater_on"])
 
+    up_s = read_uptime_seconds()
+    up_txt = format_uptime(up_s)
+    
     return jsonify({
         "repeater": rep,
         "cooldown": cooldown_left(),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "uptime_s": up_s,
+        "uptime": up_txt,
         "client_ip": client_ip(),
 
         "lan_ip": lan,

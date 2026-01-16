@@ -1,0 +1,450 @@
+/*
+============================================================================
+File     : monitor.js
+Generated: 2026-01-16 11:45 (Europe/Amsterdam)
+Description:
+  JS voor /monitor (historisch dashboard).
+  - 3 grafieken (CPU / INT / EXT)
+  - Rolling gemiddelde lijn (60s) per grafiek (trend)
+  - CPU-load tabel onder de CPU kaart (optioneel; verschijnt alleen als backend "load" levert)
+============================================================================
+*/
+
+/* ---------- Config ---------- */
+
+const DEFAULT_LAST_HOURS = 48;
+const DEFAULT_AUTO_REFRESH_SEC = 10;
+
+const API_DATA   = "/monitor/api/data";
+const API_HEALTH = "/monitor/api/health";
+
+/* ---------- State ---------- */
+
+let cpuChart = null;
+let intChart = null;
+let extChart = null;
+
+let lastHours = DEFAULT_LAST_HOURS;
+let autoRefreshSec = DEFAULT_AUTO_REFRESH_SEC;
+let autoEnabled = false;
+let refreshTimer = null;
+let refreshIntervalSec = 10; // default
+let tabIsVisible = true;
+
+/* ---------- CPU load table (optional) ---------- */
+
+function _formatPct(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
+  // API kan 0..1 of 0..100 leveren; normaliseer pragmatisch
+  const pct = v <= 1.0 ? v * 100.0 : v;
+  return `${pct.toFixed(1)} %`;
+}
+
+function _fmtTime(ts) {
+  if (!Number.isFinite(ts)) return "—";
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit" });
+}
+
+function updateCpuLoadTable(cpuPointsOrLoadSeries) {
+  const wrap = document.getElementById("cpuLoadWrap");
+  const body = document.getElementById("cpuLoadBody");
+  if (!wrap || !body) return;
+
+  // cpuPointsOrLoadSeries: meestal data.cpu (array met {ts,temp,hum,...,load?})
+  // of data.cpu_load (array met {ts,load}).
+  if (!Array.isArray(cpuPointsOrLoadSeries) || cpuPointsOrLoadSeries.length === 0) {
+    wrap.style.display = "none";
+    body.innerHTML = "";
+    return;
+  }
+
+  // Extract load per punt (accepteer verschillende key-namen)
+  const points = cpuPointsOrLoadSeries
+    .map(p => {
+      const ts = Number(p.ts);
+      const load = (p.load !== undefined) ? Number(p.load)
+                 : (p.load_pct !== undefined) ? Number(p.load_pct)
+                 : (p.value !== undefined) ? Number(p.value) : NaN;
+      return { ts, load };
+    })
+    .filter(p => Number.isFinite(p.ts) && Number.isFinite(p.load));
+
+  if (points.length === 0) {
+    wrap.style.display = "none";
+    body.innerHTML = "";
+    return;
+  }
+
+  // Laatste N regels (N=20)
+  const N = 20;
+  const tail = points.slice(-N);
+
+  // Rolling average over 5 samples (≈ 5 minuten bij 60s logging)
+  const avgWindow = 5;
+  const rows = tail.map((p, idx) => {
+    const start = Math.max(0, points.length - N + idx - (avgWindow - 1));
+    const end = Math.max(0, points.length - N + idx);
+    const slice = points.slice(start, end + 1);
+    const avg = slice.reduce((s, x) => s + x.load, 0) / slice.length;
+    return { ts: p.ts, load: p.load, avg };
+  });
+
+  body.innerHTML = rows
+    .reverse() // nieuwste bovenaan
+    .map(r => {
+      return `
+        <tr>
+          <td>${_fmtTime(r.ts)}</td>
+          <td style="text-align:right;">${_formatPct(r.load)}</td>
+          <td style="text-align:right;">${_formatPct(r.avg)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  wrap.style.display = "";
+}
+
+/* ---------- Helpers ---------- */
+
+function $(id) { return document.getElementById(id); }
+
+function setDot(state) {
+  const dot = $("dotHealth");
+  if (!dot) return;
+  dot.classList.remove("ok", "warn");
+  if (state === "ok") dot.classList.add("ok");
+  else if (state === "warn") dot.classList.add("warn");
+}
+
+function setHealthText(txt) {
+  const el = $("healthText");
+  if (el) el.textContent = txt;
+}
+
+function parseNum(v) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function toSeries(points, key) {
+  // points: [{ts: unix, temp: number|null, hum: number|null, ...}]
+  // returns { labels: [...], values: [...] }
+  const labels = [];
+  const values = [];
+
+  for (const p of points) {
+    const ts = parseNum(p.ts);
+    const val = parseNum(p[key]);
+    if (!ts || val === null) continue;
+    labels.push(new Date(ts * 1000));
+    values.push(val);
+  }
+  return { labels, values };
+}
+
+function rollingAvg(values, windowSize) {
+  const out = [];
+  for (let i = 0; i < values.length; i++) {
+    const start = Math.max(0, i - windowSize + 1);
+    const slice = values.slice(start, i + 1);
+    const avg = slice.reduce((a, b) => a + b, 0) / slice.length;
+    out.push(avg);
+  }
+  return out;
+}
+
+function fmtNow(temp, hum) {
+  const parts = [];
+  if (temp !== null && temp !== undefined) parts.push(`${temp.toFixed(1)}°C`);
+  if (hum !== null && hum !== undefined) parts.push(`${hum.toFixed(0)}%`);
+  return parts.length ? parts.join(" · ") : "—";
+}
+
+function setNow(id, temp, hum) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = fmtNow(temp, hum);
+}
+
+/* ---------- Charts ---------- */
+
+function buildChart(canvasId, title, seriesTemp, seriesHum, yTempLabel, yHumLabel) {
+  const ctx = $(canvasId).getContext("2d");
+
+  // Rolling average (60s) => window 3 samples (3 min) by default, tweakable
+  const avgWindow = 3;
+
+  const tempAvg = rollingAvg(seriesTemp.values, avgWindow);
+  const humAvg = seriesHum ? rollingAvg(seriesHum.values, avgWindow) : null;
+
+  const datasets = [];
+
+  // TEMP series
+  datasets.push({
+    label: `${title} temp (°C)`,
+    data: seriesTemp.labels.map((d, i) => ({ x: d, y: seriesTemp.values[i] })),
+    borderColor: "#4da3ff",
+    backgroundColor: "rgba(77,163,255,0.15)",
+    tension: 0.25,
+    pointRadius: 0,
+    fill: true,
+    borderWidth: 2
+  });
+
+  datasets.push({
+    label: `${title} temp avg (60s)`,
+    data: seriesTemp.labels.map((d, i) => ({ x: d, y: tempAvg[i] })),
+    borderColor: "rgba(255,255,255,0.35)",
+    backgroundColor: "transparent",
+    tension: 0.25,
+    pointRadius: 0,
+    borderDash: [6, 6],
+    borderWidth: 1.5
+  });
+
+  // HUM series (optional)
+  if (seriesHum && seriesHum.values.length) {
+    datasets.push({
+      label: `${title} hum (%)`,
+      data: seriesHum.labels.map((d, i) => ({ x: d, y: seriesHum.values[i] })),
+      borderColor: "#2bd4a6",
+      backgroundColor: "rgba(43,212,166,0.12)",
+      tension: 0.25,
+      pointRadius: 0,
+      fill: false,
+      borderWidth: 2,
+      yAxisID: "y1"
+    });
+
+    datasets.push({
+      label: `${title} hum avg (60s)`,
+      data: seriesHum.labels.map((d, i) => ({ x: d, y: humAvg[i] })),
+      borderColor: "rgba(255,255,255,0.25)",
+      backgroundColor: "transparent",
+      tension: 0.25,
+      pointRadius: 0,
+      borderDash: [6, 6],
+      borderWidth: 1.5,
+      yAxisID: "y1"
+    });
+  }
+
+  return new Chart(ctx, {
+    type: "line",
+    data: { datasets },
+    options: {
+      maintainAspectRatio: false,
+      parsing: false,
+      animation: false,
+      plugins: {
+        legend: {
+          labels: { color: "rgba(255,255,255,0.75)" }
+        },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const v = ctx.parsed.y;
+              if (v === null || v === undefined) return "";
+              return `${ctx.dataset.label}: ${v.toFixed(2)}`;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          type: "time",
+          time: { unit: "hour" },
+          grid: { color: "rgba(255,255,255,0.06)" },
+          ticks: { color: "rgba(255,255,255,0.55)" }
+        },
+        y: {
+          title: { display: true, text: yTempLabel, color: "rgba(255,255,255,0.55)" },
+          grid: { color: "rgba(255,255,255,0.06)" },
+          ticks: { color: "rgba(255,255,255,0.55)" }
+        },
+        y1: {
+          display: !!seriesHum,
+          position: "right",
+          title: { display: true, text: yHumLabel, color: "rgba(255,255,255,0.55)" },
+          grid: { drawOnChartArea: false },
+          ticks: { color: "rgba(255,255,255,0.55)" }
+        }
+      }
+    }
+  });
+}
+
+function updateChart(chart, title, seriesTemp, seriesHum) {
+  const avgWindow = 3;
+  const tempAvg = rollingAvg(seriesTemp.values, avgWindow);
+  const humAvg = seriesHum ? rollingAvg(seriesHum.values, avgWindow) : null;
+
+  // dataset order:
+  // 0: temp
+  // 1: temp avg
+  // 2: hum (optional)
+  // 3: hum avg (optional)
+  chart.data.datasets[0].data = seriesTemp.labels.map((d, i) => ({ x: d, y: seriesTemp.values[i] }));
+  chart.data.datasets[1].data = seriesTemp.labels.map((d, i) => ({ x: d, y: tempAvg[i] }));
+
+  if (seriesHum && chart.data.datasets.length >= 4) {
+    chart.data.datasets[2].data = seriesHum.labels.map((d, i) => ({ x: d, y: seriesHum.values[i] }));
+    chart.data.datasets[3].data = seriesHum.labels.map((d, i) => ({ x: d, y: humAvg[i] }));
+  }
+
+  chart.update("none");
+}
+
+/* ---------- Fetch / render ---------- */
+
+async function fetchHealth() {
+  try {
+    const r = await fetch(API_HEALTH, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    // expecting {ok: true, msg: "..."} but handle gracefully
+    setDot(j.ok ? "ok" : "warn");
+    setHealthText(j.msg || (j.ok ? "OK" : "WARN"));
+  } catch (e) {
+    setDot("warn");
+    setHealthText("offline");
+  }
+}
+
+async function fetchData(hours) {
+  const qs = new URLSearchParams({ hours: String(hours) });
+  const url = `${API_DATA}?${qs.toString()}`;
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
+}
+
+function initCharts(initialData) {
+  const cpuTemp = toSeries(initialData.cpu || [], "temp");
+  const cpuHum  = toSeries(initialData.cpu || [], "hum");
+
+  const intTemp = toSeries(initialData.int || [], "temp");
+  const intHum  = toSeries(initialData.int || [], "hum");
+
+  const extTemp = toSeries(initialData.ext || [], "temp");
+  const extHum  = toSeries(initialData.ext || [], "hum");
+
+  cpuChart = buildChart("cpuChart", "CPU", cpuTemp, cpuHum, "°C", "%");
+  intChart = buildChart("intChart", "INT", intTemp, intHum, "°C", "%");
+  extChart = buildChart("extChart", "EXT", extTemp, extHum, "°C", "%");
+}
+
+function updateAllCharts(data) {
+  const cpuTemp = toSeries(data.cpu || [], "temp");
+  const cpuHum  = toSeries(data.cpu || [], "hum");
+
+  const intTemp = toSeries(data.int || [], "temp");
+  const intHum  = toSeries(data.int || [], "hum");
+
+  const extTemp = toSeries(data.ext || [], "temp");
+  const extHum  = toSeries(data.ext || [], "hum");
+
+  updateChart(cpuChart, "CPU", cpuTemp, cpuHum);
+  updateChart(intChart, "INT", intTemp, intHum);
+  updateChart(extChart, "EXT", extTemp, extHum);
+}
+
+function lastPoint(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  return arr[arr.length - 1];
+}
+
+async function loadAndRender() {
+  const data = await fetchData(lastHours);
+
+  if (!cpuChart) initCharts(data);
+  else updateAllCharts(data);
+
+  // now indicators (last values)
+  const cpuLast = lastPoint(data.cpu)?.temp ?? null;
+  const intLast = lastPoint(data.int)?.temp ?? null;
+  const extTempLast = lastPoint(data.ext)?.temp ?? null;
+  const extHumLast  = lastPoint(data.ext)?.hum ?? null;
+
+  setNow("nowCpu", cpuLast, null);
+  setNow("nowInt", intLast, null);
+  setNow("nowExt", extTempLast, extHumLast);
+
+  // CPU load tabel (optioneel; werkt alleen als backend "load" meelevert)
+  updateCpuLoadTable(data.cpu_load || data.cpu);
+
+  await fetchHealth();
+}
+
+/* ---------- Auto refresh ---------- */
+
+function stopAuto() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+  autoEnabled = false;
+}
+
+function startAuto() {
+  stopAuto();
+  if (autoRefreshSec <= 0) return;
+
+  autoEnabled = true;
+  refreshTimer = setInterval(async () => {
+    if (!tabIsVisible) return;
+    try { await loadAndRender(); } catch (e) { /* ignore */ }
+  }, autoRefreshSec * 1000);
+}
+
+/* ---------- Events ---------- */
+
+function onVisibilityChange() {
+  tabIsVisible = !document.hidden;
+}
+
+function readControls() {
+  const h = parseInt($("lastHours")?.value || `${DEFAULT_LAST_HOURS}`, 10);
+  lastHours = Number.isFinite(h) && h > 0 ? h : DEFAULT_LAST_HOURS;
+
+  const a = parseInt($("autoRefresh")?.value || `${DEFAULT_AUTO_REFRESH_SEC}`, 10);
+  autoRefreshSec = Number.isFinite(a) ? a : DEFAULT_AUTO_REFRESH_SEC;
+}
+
+async function main() {
+  // initial controls
+  if ($("lastHours")) $("lastHours").value = String(DEFAULT_LAST_HOURS);
+  if ($("autoRefresh")) $("autoRefresh").value = String(DEFAULT_AUTO_REFRESH_SEC);
+
+  $("btnFetch")?.addEventListener("click", async () => {
+    readControls();
+    await loadAndRender();
+  });
+
+  $("btnToggleAuto")?.addEventListener("click", async () => {
+    readControls();
+    if (autoEnabled) stopAuto();
+    else startAuto();
+    // immediate refresh
+    await loadAndRender();
+  });
+
+  $("autoRefresh")?.addEventListener("change", () => {
+    readControls();
+    if (autoEnabled) startAuto();
+  });
+
+  document.addEventListener("visibilitychange", onVisibilityChange);
+
+  // first load
+  readControls();
+  await loadAndRender();
+}
+
+main().catch(() => {
+  setDot("warn");
+  setHealthText("init error");
+});
