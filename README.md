@@ -5,6 +5,9 @@
 **Status:** Operationeel, productiegeschikt  
 **Doel:** Stand-alone controller voor repeaterbeheer met lokale UI, webfrontend, monitoring en beveiliging
 
+![front-2026](https://github.com/user-attachments/assets/3cc46376-42ee-4468-aa1d-5b9d58eb03b0)
+
+
 ---
 
 ## Inhoudsopgave
