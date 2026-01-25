@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-25 12:00 (Europe/Amsterdam)
+# Generated   : 2026-01-25 12:45 (Europe/Amsterdam)
 # Description :
 #   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #
@@ -243,6 +243,7 @@ def parse_api_state(payload: dict) -> dict:
 
         if isinstance(cpu, dict):
             out["cpu_temp_c"] = as_float(cpu.get("temp"))
+            out["cpu_load_pct"] = as_float(cpu.get("load"))
     except Exception as e:
         log(f"PARSE ERROR: {type(e).__name__}: {e}")
     return out
@@ -467,13 +468,18 @@ def build_screen(state: dict, standby_countdown: Optional[int]) -> Image.Image:
 
     cpu_pct = (state or {}).get("cpu_load_pct")
     cpu_pct_txt = ""
-    if isinstance(cpu_pct, int) and 0 <= cpu_pct <= 100:
-        cpu_pct_txt = f"   {cpu_pct}%"
+    if cpu_pct is not None:
+        try:
+            pct_val = int(round(float(cpu_pct)))
+            if 0 <= pct_val <= 100:
+                cpu_pct_txt = f"   {pct_val}%"
+        except (ValueError, TypeError):
+            pass
 
     rows = [
         ("INT TEMP", fmt_1(t_int, " C"), fmt_1(h_int, " %"), color_for_temp_c(t_int), color_for_hum_pct(h_int)),
         ("EXT TEMP", fmt_1(t_ext, " C"), fmt_1(h_ext, " %"), color_for_temp_c(t_ext), color_for_hum_pct(h_ext)),
-        ("CPU TEMP", fmt_1(t_cpu, " C") + cpu_pct_txt, None, color_for_temp_c(t_cpu), WHITE),
+        ("CPU RPI", fmt_1(t_cpu, " C") + cpu_pct_txt, None, color_for_temp_c(t_cpu), WHITE),
     ]
 
     # Bottom row: cooldown OR uptime, but if standby_countdown is active (5..1) override text
@@ -619,11 +625,13 @@ def main() -> int:
             wan_ip = (state or {}).get("ip_external") or "—"
             state["wan_iface"] = detect_wan_iface_label(str(wan_ip), cached_dev)
 
-            # CPU load sampling (only when drawing; 1Hz)
+            # CPU load: use API value, fallback to local sampling
             if draw_active and (now - last_cpu_check) >= 1.0:
-                pct = read_cpu_load_pct()
-                if pct is not None:
-                    state["cpu_load_pct"] = pct
+                api_cpu_load = (state or {}).get("cpu_load_pct")
+                if api_cpu_load is None:
+                    pct = read_cpu_load_pct()
+                    if pct is not None:
+                        state["cpu_load_pct"] = pct
                 last_cpu_check = now
 
             # Determine draw_active based on backend activity age (only if backend not stale)
