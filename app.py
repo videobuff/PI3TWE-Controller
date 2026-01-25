@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ======================================================
 # File: /srv/pi3twe/app/app.py
-# DATUM_TIJD_APP_GENEREREN = "2026-01-25 11:50 (Europe/Amsterdam)"
+# DATUM_TIJD_APP_GENEREREN = "2026-01-25 12:20 (Europe/Amsterdam)"
 # Description: PI3TWE Controller backend
 #  - SQLite users + audit log + settings
 #  - Login (ident OR username OR email), sessions
@@ -82,7 +82,20 @@ import urllib.error
 INFLUXDB_ENABLED = os.environ.get("PI3TWE_INFLUXDB_ENABLED", "1") == "1"
 INFLUXDB_URL = os.environ.get("PI3TWE_INFLUXDB_URL", "http://127.0.0.1:8181")
 INFLUXDB_DATABASE = os.environ.get("PI3TWE_INFLUXDB_DATABASE", "pi3twe")
-INFLUXDB_TOKEN = os.environ.get("PI3TWE_INFLUXDB_TOKEN", "apiv3_w4oHVF1Het8qY41d_R-qEVU8EA_RQ0UYuEqYqYkTre0m0oTif8O1ic90HYmrDgR2PyR1Q-Np9Xm9kl8Y8uksYw")
+
+# Token from environment or secrets file (never hardcode!)
+def _load_influxdb_token():
+    token = os.environ.get("PI3TWE_INFLUXDB_TOKEN")
+    if token:
+        return token
+    token_file = "/srv/pi3twe/app/secrets/influxdb_token.txt"
+    try:
+        with open(token_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+INFLUXDB_TOKEN = _load_influxdb_token()
 
 # Set to "0" to disable SQLite monitor writes (InfluxDB only)
 SQLITE_MONITOR_ENABLED = os.environ.get("PI3TWE_SQLITE_MONITOR_ENABLED", "0") == "1"
