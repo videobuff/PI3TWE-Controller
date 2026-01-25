@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ======================================================
 # File: /srv/pi3twe/app/app.py
-# DATUM_TIJD_APP_GENEREREN = "2026-01-25 12:20 (Europe/Amsterdam)"
+# DATUM_TIJD_APP_GENEREREN = "2026-01-25 13:00 (Europe/Amsterdam)"
 # Description: PI3TWE Controller backend
 #  - SQLite users + audit log + settings
 #  - Login (ident OR username OR email), sessions
@@ -1632,6 +1632,18 @@ def api_me():
         "notify_enabled": bool(u["notify_enabled"]),
         "totp_enabled": bool(u["totp_enabled"]),
     })
+
+
+@app.get("/api/auth-check")
+def api_auth_check():
+    """
+    Lightweight auth check for nginx auth_request.
+    Returns 200 if logged in, 401 if not.
+    Used to protect Grafana and other internal services.
+    """
+    if current_user():
+        return "", 200
+    return "", 401
 
 
 # ======================================================
