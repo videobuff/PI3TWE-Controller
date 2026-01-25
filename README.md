@@ -1,38 +1,40 @@
-# PI3TWE Controller – Projectarchief
+# PI3TWE Controller
 
-**Platform:** Raspberry Pi 3  
+**Platform:** Raspberry Pi 4+  
 **Periode:** Najaar–Winter 2025 / Januari 2026  
 **Status:** Operationeel, productiegeschikt  
-**Doel:** Stand-alone controller voor repeaterbeheer met lokale UI, webfrontend en beveiliging
+**Doel:** Stand-alone controller voor repeaterbeheer met lokale UI, webfrontend, monitoring en beveiliging
 
 ---
 
 ## Inhoudsopgave
 
-1. Projectdoel  
-2. Architectuuroverzicht  
-3. Backend (Flask)  
-4. Frontend (Apache HTML)  
-5. TFT-scherm (Framebuffer UI)  
-6. Gebruikersbeheer & Authenticatie  
-7. Hardware-integratie  
-8. Beveiliging & Hardening (Fail2ban)  
-9. Prerequisites & Installatie-eisen  
-10. Archiefstructuur  
-11. Huidige status  
+1. [Projectdoel](#1-projectdoel)
+2. [Architectuuroverzicht](#2-architectuuroverzicht)
+3. [Backend (Flask)](#3-backend-flask)
+4. [Frontend (Apache HTML)](#4-frontend-apache-html)
+5. [TFT-scherm (Framebuffer UI)](#5-tft-scherm-framebuffer-ui)
+6. [Monitoring & Grafana](#6-monitoring--grafana)
+7. [Gebruikersbeheer & Authenticatie](#7-gebruikersbeheer--authenticatie)
+8. [Hardware-integratie](#8-hardware-integratie)
+9. [Beveiliging & Hardening](#9-beveiliging--hardening)
+10. [Installatie & Configuratie](#10-installatie--configuratie)
+11. [Bestandsstructuur](#11-bestandsstructuur)
+12. [Onderhoud](#12-onderhoud)
 
 ---
 
 ## 1. Projectdoel
 
-Het PI3TWE-project heeft als doel het realiseren van een **betrouwbare, veilige en autonome controller** voor een repeaterinstallatie op locatie, met:
+Het PI3TWE-project realiseert een **betrouwbare, veilige en autonome controller** voor een repeaterinstallatie op locatie, met:
 
-- lokale en externe bediening
-- gebruikersauthenticatie met optionele 2FA
-- relaisbesturing
-- status- en sensormonitoring
-- lokale visuele feedback via TFT
-- minimale afhankelijkheid van externe diensten
+- Lokale en externe bediening via web en fysieke knop
+- Gebruikersauthenticatie met optionele 2FA (TOTP)
+- Relaisbesturing met cooldown-bescherming
+- Status- en sensormonitoring (CPU, temperatuur, luchtvochtigheid)
+- Real-time dashboards via Grafana
+- Lokale visuele feedback via TFT-scherm
+- Minimale afhankelijkheid van externe diensten
 
 Het systeem is ontworpen voor **onbemande werking**.
 
@@ -40,225 +42,391 @@ Het systeem is ontworpen voor **onbemande werking**.
 
 ## 2. Architectuuroverzicht
 
-Het systeem bestaat uit drie strikt gescheiden lagen:
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Raspberry Pi 3B+                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │   Apache     │    │    Flask     │    │   Grafana    │      │
+│  │   :443       │───▶│   :3001      │    │   :3000      │      │
+│  │  (HTTPS)     │    │ (localhost)  │    │  (localhost) │      │
+│  └──────────────┘    └──────┬───────┘    └──────┬───────┘      │
+│                             │                   │               │
+│                             ▼                   ▼               │
+│                      ┌──────────────┐    ┌──────────────┐      │
+│                      │   SQLite     │    │  InfluxDB 3  │      │
+│                      │  (users/     │    │   :8181      │      │
+│                      │   audit)     │    │  (metrics)   │      │
+│                      └──────────────┘    └──────────────┘      │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │  TFT 3.5"    │    │   DHT11 x2   │    │    Relais    │      │
+│  │  (SPI/FB)    │    │  INT / EXT   │    │   (GPIO17)   │      │
+│  └──────────────┘    └──────────────┘    └──────────────┘      │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### 2.1 Backend
-- Python 3 + Flask
-- Draait uitsluitend op `127.0.0.1`
-- JSON-API
-- Hardware- en logica-afhandeling
+### Lagen
 
-### 2.2 Frontend
-- Apache webserver
-- HTML / CSS / JavaScript
-- Communiceert met backend via localhost-API
-
-### 2.3 TFT-UI
-- Aparte Python applicatie
-- Framebuffer-based (`/dev/fb*`)
-- Geen X11, geen touch
-- Communiceert via token-protected API
+| Laag | Component | Poort | Functie |
+|------|-----------|-------|---------|
+| Frontend | Apache | 443 (HTTPS) | Webinterface, reverse proxy |
+| Backend | Flask/Gunicorn | 3001 (localhost) | JSON API, hardware control |
+| Monitoring | Grafana | 3000 (localhost) | Dashboards |
+| Database | InfluxDB 3 Core | 8181 (localhost) | Tijdreeksdata |
+| Database | SQLite | - | Users, audit, settings |
+| Display | TFT App | - | Lokale status weergave |
 
 ---
 
 ## 3. Backend (Flask)
 
-### 3.1 Algemene kenmerken
-- Luistert alleen op localhost
-- Geen directe internet-exposure
-- Sessies via Flask cookies
-- Persistente secret key (bestand)
+### 3.1 Kenmerken
+- Luistert alleen op `127.0.0.1:3001`
+- JSON-only API responses
+- Gunicorn WSGI server (1 worker, 4 threads)
+- Sessies via secure cookies
 
-### 3.2 Database
-SQLite met o.a.:
-- `users`
-- `settings`
-- `audit_log`
+### 3.2 Databases
 
-### 3.3 API-eigenschappen
-- JSON-only
-- Duidelijke scheiding tussen:
-  - auth
-  - gebruikersbeheer
-  - hardware
-  - TFT-endpoints
+**SQLite** (`pi3twe.db`):
+- `users` - Gebruikersbeheer
+- `settings` - Configuratie
+- `audit_log` - Audit trail
+
+**InfluxDB 3 Core** (Docker):
+- `measurements` - CPU temp, load, DHT sensoren
+- 60 seconden interval
+- Moving average voor CPU load (5 samples)
+
+### 3.3 API Endpoints
+
+| Endpoint | Methode | Functie |
+|----------|---------|---------|
+| `/api/state` | GET | Systeem status |
+| `/api/repeater` | POST | Repeater toggle |
+| `/api/login` | POST | Authenticatie |
+| `/api/logout` | POST | Sessie beëindigen |
+| `/api/admin/users` | GET/POST | Gebruikersbeheer |
+| `/api/fail2ban` | GET | Fail2ban status |
+| `/metrics` | GET | Prometheus metrics |
 
 ---
 
 ## 4. Frontend (Apache HTML)
 
 ### 4.1 Locatie
-/var/www/pi3twe
+```
+/var/www/pi3twe/
+└── index.html
+```
 
 ### 4.2 Functie
-- Webinterface voor gebruikers en beheer
-- Draait onder Apache
-- Enige internet-exposed component
+- Responsive webinterface
+- Login/logout met 2FA ondersteuning
+- Repeater bediening
+- Status weergave
+- Admin gebruikersbeheer
 
 ### 4.3 Communicatie
-- `fetch()` / AJAX naar Flask backend
-- Backend alleen via `127.0.0.1`
+- AJAX/fetch naar Flask backend via localhost proxy
+- Apache als reverse proxy naar `:3001`
 
 ---
 
 ## 5. TFT-scherm (Framebuffer UI)
 
 ### 5.1 Hardware
-- 3.5 inch TFT
-- Resolutie: 480 × 320
-- XPT2046 touchcontroller niet gebruikt
+- 3.5 inch TFT (480×320)
+- SPI interface
+- Geen X11, direct framebuffer
 
 ### 5.2 Software
-- `tft_app_fb.py`
-- Tekent direct op framebuffer
-- Geen GUI-frameworks
+- `tft/tft_app_fb.py`
+- Systemd service: `pi3twe-tft.service`
+- Haalt data via `/api/state`
 
-### 5.3 Functie
-- Repeater status
-- Sensorwaarden
-- Netwerk/statusinformatie
-- Bediening via fysieke omgeving
+### 5.3 Weergave
+- PI3TWE logo en titel
+- INT/EXT temperatuur en luchtvochtigheid
+- CPU temperatuur en load percentage
+- Uptime of cooldown timer
+- Kleurcodering (groen/oranje/rood)
 
 ---
 
-## 6. Gebruikersbeheer & Authenticatie
+## 6. Monitoring & Grafana
 
-### 6.1 Login
-- Gebruikersnaam + wachtwoord
-- Sessies persistent over reboot
+### 6.1 InfluxDB 3 Core
 
-### 6.2 Rollen
-- Admin
-- Gebruiker
+**Docker container:**
+```bash
+docker run -d \
+  --name influxdb3 \
+  -p 8181:8181 \
+  -v /srv/pi3twe/data/influxdb3:/var/lib/influxdb3 \
+  --restart unless-stopped \
+  influxdb:3-core \
+  serve --node-id pi3twe
+```
 
-### 6.3 2FA (TOTP)
+**Database:** `pi3twe`
+
+**Measurements:**
+| source | temp | hum |
+|--------|------|-----|
+| cpu | CPU temp (°C) | CPU load (%) |
+| int | INT temp (°C) | INT humidity (%) |
+| ext | EXT temp (°C) | EXT humidity (%) |
+| load1 | 1m load avg | - |
+| load5 | 5m load avg | - |
+| load15 | 15m load avg | - |
+
+### 6.2 Grafana
+
+**Datasource configuratie:**
+- Type: InfluxDB
+- Query Language: SQL
+- URL: `http://127.0.0.1:8181`
+- Database: `pi3twe`
+- Token: uit `/srv/pi3twe/app/secrets/influxdb_token.txt`
+- Insecure Connection: aan
+
+**Dashboard panels:**
+- CPU Temperature (stat)
+- CPU Load (stat)
+- INT Temperature (stat)
+- INT Humidity (stat)
+- CPU Temp & Load (time series)
+- INT/EXT Temp & Humidity (time series)
+
+**Voorbeeld queries:**
+```sql
+-- CPU Temperature
+SELECT time, temp FROM measurements WHERE source = 'cpu'
+
+-- CPU Load
+SELECT time, hum FROM measurements WHERE source = 'cpu'
+
+-- INT/EXT Temperature
+SELECT time, temp FROM measurements WHERE source = 'int'
+SELECT time, temp FROM measurements WHERE source = 'ext'
+```
+
+---
+
+## 7. Gebruikersbeheer & Authenticatie
+
+### 7.1 Login
+- Gebruikersnaam/email + wachtwoord
+- Persistente sessies
+
+### 7.2 Rollen
+- **Superadmin** - Volledige toegang, kan users verwijderen
+- **Admin** - Gebruikersbeheer
+- **User** - Basis bediening
+
+### 7.3 2FA (TOTP)
 - Per gebruiker instelbaar
-- Niet globaal verplicht
+- Google Authenticator compatible
 - Admin kan 2FA resetten
-- Mixed omgevingen toegestaan
 
 ---
 
-## 7. Hardware-integratie
+## 8. Hardware-integratie
 
-### 7.1 Relais
-- GPIO-gestuurd
-- Cooldown ter bescherming
-- Status zichtbaar via web en TFT
+### 8.1 GPIO Pinout
 
-### 7.2 Sensoren
-- BMP280 / BME280 (indien aanwezig)
-- CPU temperatuur
-- Best-effort detectie
-- Geen crash bij ontbrekende hardware
-- Pin conector aanlsuitinten 6 - pins.
-- Groen     -  4    VCC
-- Groen Wit  - 5    GND
-- Oranje     - 1    SCL
-- Oranje wit - 2    SDA
+| Functie | GPIO | Physical Pin |
+|---------|------|--------------|
+| Relais | 17 | 11 |
+| Button | 23 | 16 |
+| DHT11 INT | 26 | 37 |
+| DHT11 EXT | 20 | 38 |
+
+### 8.2 Relais
+- Active-high schakeling
+- Cooldown bescherming (configureerbaar)
+- Status via web, API en TFT
+
+### 8.3 DHT11 Sensoren
+- INT: Binnentemperatuur en luchtvochtigheid
+- EXT: Buitentemperatuur en luchtvochtigheid
+- Pull-up weerstand: 4.7kΩ
+- Best-effort: geen crash bij ontbrekende sensor
+
+### 8.4 TFT Display
+- SPI interface
+- Framebuffer: `/dev/fb1`
+- Resolutie: 480×320
 
 ---
 
-## 8. Beveiliging & Hardening (Fail2ban)
+## 9. Beveiliging & Hardening
 
-### 8.1 Doel
-Bescherming tegen:
-- brute-force aanvallen
-- bots en scanners
-- misbruik van Apache en SSH
+### 9.1 Fail2ban
 
-### 8.2 Actieve jails
-Actief per 2026-01-01:
-
+**Actieve jails:**
 - `sshd`
 - `apache-auth`
 - `apache-badbots`
 - `apache-noscript`
-- `apache-nohome`
 - `apache-overflows`
 
-Geen andere jails zijn actief.
-
-### 8.3 Whitelistingbeleid
-
-Gewhitelist:
+**Whitelist:**
 - `127.0.0.1/8`
 - `::1`
-- lokaal LAN (`192.168.2.0/24`)
+- `192.168.2.0/24` (lokaal LAN)
 
-Niet gewhitelist:
-- publieke IPv4-adressen
-- publieke IPv6-adressen
+### 9.2 Netwerk
+- Flask alleen op localhost
+- Apache als enige externe toegang
+- HTTPS verplicht
+- Grafana alleen via localhost/tunnel
 
-Voorbeelden (niet gewhitelist):
-- IPv4: `81.207.216.66`
-- IPv6: `2a02:a454:16e2:0:342e:9a48:1e06:6648`
+### 9.3 Secrets
+Alle secrets in `/srv/pi3twe/app/secrets/`:
+- `flask_secret.key`
+- `tft_token.txt`
+- `influxdb_token.txt`
+- `msmtprc` (mail config)
 
-**Reden:**
-- Publieke adressen zijn exact wat Fail2ban moet kunnen blokkeren
-- IPv6 kan wijzigen
-- Beveiliging gaat vóór gemak
-
-### 8.4 Backend-afbakening
-- Flask backend draait alleen op localhost
-- Niet gemonitord door Fail2ban
-- Apache is enige internet-exposed laag
+**Nooit committen naar git!**
 
 ---
 
-## 9. Prerequisites & Installatie-eisen
+## 10. Installatie & Configuratie
 
-### 9.1 OS
-- Raspberry Pi OS (Debian Trixie)
+### 10.1 Prerequisites
 
-### 9.2 System packages
-- python3, pip, venv
-- apache2
-- sqlite3
-- fail2ban
-- git, curl
+**OS:** Raspberry Pi OS (Debian Bookworm/Trixie)
 
-### 9.3 Interfaces
-- SPI (TFT)
-- I2C (sensoren)
-- GPIO
+**System packages:**
+```bash
+apt install python3 python3-pip python3-venv apache2 sqlite3 fail2ban git curl docker.io
+```
 
-### 9.4 Python libraries
-- flask
-- pyotp
-- pillow
-- requests
-- adafruit-blinka (indien BME/BMP280)
+**Interfaces:** SPI, I2C, GPIO enabled via `raspi-config`
+
+### 10.2 Python Environment
+```bash
+cd /srv/pi3twe/app
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 10.3 Services
+```bash
+# Backend
+sudo systemctl enable pi3twe
+sudo systemctl start pi3twe
+
+# TFT Display
+sudo systemctl enable pi3twe-tft
+sudo systemctl start pi3twe-tft
+
+# InfluxDB (Docker)
+docker start influxdb3
+
+# Grafana
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+```
+
+### 10.4 InfluxDB Setup
+```bash
+# Database aanmaken
+docker exec influxdb3 influxdb3 create database pi3twe
+
+# Admin token genereren
+docker exec influxdb3 influxdb3 create token --admin
+
+# Token opslaan
+echo "apiv3_xxxxx..." > /srv/pi3twe/app/secrets/influxdb_token.txt
+chmod 600 /srv/pi3twe/app/secrets/influxdb_token.txt
+```
 
 ---
 
-## 10. Archiefstructuur
+## 11. Bestandsstructuur
 
-/archive/
-├─ README_PI3TWE_Projectarchief.md
-├─ app.py
-├─ tft_app_fb.py
-├─ requirements.txt
-├─ FAIL2BAN_NOTES.md (optioneel, samengevoegd in dit document)
-├─ www/
-│   └─ pi3twe/
-├─ systemd/
-│   ├─ pi3twe.service
-│   └─ pi3twe-tft.service
-
-Secrets, keys en tokens worden **niet** gearchiveerd.
-
----
-
-## 11. Huidige status
-
-- Backend stabiel
-- Frontend operationeel
-- TFT-UI functioneel
-- Gebruikersbeheer en 2FA correct
-- Fail2ban actief en getest
-- Geschikt voor langdurige onbemande inzet
+```
+/srv/pi3twe/
+├── app/
+│   ├── app.py              # Flask backend
+│   ├── wsgi.py             # Gunicorn entry point
+│   ├── init_db.py          # Database initialisatie
+│   ├── requirements.txt    # Python dependencies
+│   ├── git_all.sh          # Git helper script
+│   ├── check_pi3twe.sh     # Diagnostisch script
+│   ├── .venv/              # Python virtual environment
+│   ├── secrets/            # Keys en tokens (NIET in git)
+│   ├── tft/
+│   │   └── tft_app_fb.py   # TFT display applicatie
+│   ├── webroot/
+│   │   └── index.html      # Redirect pagina
+│   └── img/
+│       └── logo.png        # PI3TWE logo
+└── data/
+    ├── monitor.db          # SQLite metrics (legacy)
+    └── influxdb3/          # InfluxDB data directory
+```
 
 ---
 
-**Einde document**
+## 12. Onderhoud
+
+### 12.1 Logs bekijken
+```bash
+# Backend
+journalctl -u pi3twe -f
+
+# TFT
+journalctl -u pi3twe-tft -f
+
+# InfluxDB
+docker logs influxdb3 -f
+```
+
+### 12.2 Services herstarten
+```bash
+sudo systemctl restart pi3twe
+sudo systemctl restart pi3twe-tft
+docker restart influxdb3
+```
+
+### 12.3 Database queries
+```bash
+# InfluxDB - recente data
+docker exec influxdb3 influxdb3 query \
+  --database pi3twe \
+  --token "$(cat /srv/pi3twe/app/secrets/influxdb_token.txt)" \
+  "SELECT * FROM measurements ORDER BY time DESC LIMIT 10"
+```
+
+### 12.4 Git workflow
+```bash
+cd /srv/pi3twe/app
+./git_all.sh "Beschrijving van wijzigingen"
+```
+
+---
+
+## Changelog
+
+| Datum | Wijziging |
+|-------|-----------|
+| 2026-01-25 | InfluxDB 3 Core integratie, Grafana dashboards |
+| 2026-01-24 | CPU load moving average, busy loop fix |
+| 2026-01-23 | DHT11 dual sensor support |
+| 2026-01-22 | TFT framebuffer UI |
+| 2026-01-17 | Initiële release |
+
+---
+
+**Auteur:** PA0ESH  
+**Licentie:** GPL-3.0  
+**Repository:** (private)
