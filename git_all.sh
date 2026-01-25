@@ -1,34 +1,61 @@
 #!/bin/bash
 #
-# gitall - add, commit en push in één commando
+# git_all.sh - add, commit en push in één commando
 #
 # Gebruik:
-#   gitall "commit message"
+#   ./git_all.sh "commit message"
+#   ./git_all.sh                    (vraagt om message)
 #
 
 set -e
 
-if [ -z "$1" ]; then
-  echo "Gebruik: gitall \"commit message\""
+cd "$(dirname "$0")"
+
+# Kleuren
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check of we in een git repo zitten
+if [ ! -d .git ]; then
+  echo -e "${RED}Fout: geen git repository gevonden${NC}"
   exit 1
 fi
 
-MSG="$1"
+# Commit message
+if [ -z "$1" ]; then
+  echo -n "Commit message: "
+  read MSG
+  if [ -z "$MSG" ]; then
+    echo -e "${RED}Geen message opgegeven, afgebroken.${NC}"
+    exit 1
+  fi
+else
+  MSG="$1"
+fi
 
-echo "=== Git status ==="
+echo -e "${YELLOW}=== Git status ===${NC}"
 git status --short
 
-echo
-echo "=== Git add ==="
-git add -A
+# Check of er iets te committen is
+if [ -z "$(git status --porcelain)" ]; then
+  echo -e "${GREEN}Niets te committen, working tree is clean.${NC}"
+  exit 0
+fi
 
 echo
-echo "=== Git commit ==="
+echo -e "${YELLOW}=== Git add ===${NC}"
+git add -A
+echo "Alle wijzigingen gestaged."
+
+echo
+echo -e "${YELLOW}=== Git commit ===${NC}"
 git commit -m "$MSG"
 
 echo
-echo "=== Git push ==="
+echo -e "${YELLOW}=== Git push ===${NC}"
 git push
 
 echo
-echo "Klaar."
+echo -e "${GREEN}✓ Klaar!${NC}"

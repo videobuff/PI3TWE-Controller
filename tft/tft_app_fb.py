@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-15 00:25 (Europe/Amsterdam)
+# Generated   : 2026-01-25 12:00 (Europe/Amsterdam)
 # Description :
 #   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #
@@ -43,6 +43,13 @@ from datetime import datetime
 from typing import Optional, Any, Tuple
 
 from PIL import Image, ImageDraw, ImageFont  # type: ignore
+
+try:
+    import numpy as np
+    _NUMPY_OK = True
+except ImportError:
+    np = None
+    _NUMPY_OK = False
 
 
 # ------------------------------ Config --------------------------------------
@@ -378,16 +385,30 @@ class Framebuffer:
 
 
 def image_to_rgb565(im: Image.Image) -> bytes:
-    raw = im.convert("RGB").tobytes()
-    out = bytearray((len(raw) // 3) * 2)
-    j = 0
-    for i in range(0, len(raw), 3):
-        r, g, b = raw[i], raw[i + 1], raw[i + 2]
-        v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-        out[j] = v & 0xFF
-        out[j + 1] = (v >> 8) & 0xFF
-        j += 2
-    return bytes(out)
+    """
+    Convert PIL Image to RGB565 bytes for framebuffer.
+    Uses numpy if available (10x+ faster), falls back to pure Python.
+    """
+    if _NUMPY_OK:
+        # Fast numpy conversion
+        arr = np.array(im.convert("RGB"), dtype=np.uint16)
+        r = (arr[:, :, 0] & 0xF8) << 8
+        g = (arr[:, :, 1] & 0xFC) << 3
+        b = arr[:, :, 2] >> 3
+        rgb565 = (r | g | b).astype(np.uint16)
+        return rgb565.tobytes()
+    else:
+        # Fallback: pure Python (slow)
+        raw = im.convert("RGB").tobytes()
+        out = bytearray((len(raw) // 3) * 2)
+        j = 0
+        for i in range(0, len(raw), 3):
+            r, g, b = raw[i], raw[i + 1], raw[i + 2]
+            v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            out[j] = v & 0xFF
+            out[j + 1] = (v >> 8) & 0xFF
+            j += 2
+        return bytes(out)
 
 
 # ------------------------------ UI ------------------------------------------
@@ -447,7 +468,7 @@ def build_screen(state: dict, standby_countdown: Optional[int]) -> Image.Image:
     cpu_pct = (state or {}).get("cpu_load_pct")
     cpu_pct_txt = ""
     if isinstance(cpu_pct, int) and 0 <= cpu_pct <= 100:
-        cpu_pct_txt = f"   {cpu_pct:02d}%"
+        cpu_pct_txt = f"   {cpu_pct}%"
 
     rows = [
         ("INT TEMP", fmt_1(t_int, " C"), fmt_1(h_int, " %"), color_for_temp_c(t_int), color_for_hum_pct(h_int)),
@@ -460,7 +481,7 @@ def build_screen(state: dict, standby_countdown: Optional[int]) -> Image.Image:
         rows.append(("TFT", f"SCREEN IN STAND BY ({standby_countdown})", None, WHITE, WHITE))
     else:
         if cooldown > 0:
-            rows.append(("COOLDOWN", f"{cooldown:02d} s", None, WHITE, WHITE))
+            rows.append(("COOLDOWN", f"{cooldown} s", None, WHITE, WHITE))
         else:
             uptime_text = (state or {}).get("uptime_text") or "—"
             rows.append(("UPTIME", uptime_text, None, WHITE, WHITE))

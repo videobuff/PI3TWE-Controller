@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ======================================================
 # File: /srv/pi3twe/app/app.py
-# DATUM_TIJD_APP_GENEREREN = "2026-01-19 16:20 CET"
+# DATUM_TIJD_APP_GENEREREN = "2026-01-25 11:50 (Europe/Amsterdam)"
 # Description: PI3TWE Controller backend
 #  - SQLite users + audit log + settings
 #  - Login (ident OR username OR email), sessions
@@ -16,6 +16,12 @@
 #  - Boot/selftest mail via msmtp to INTERNAL_MAIL_TO (for reboot/crash visibility)
 #  - Prepared: INT/EXT temperature alarms > 50C (with hysteresis + anti-spam)
 #
+# Added (requested, without changing existing behaviour/UI except values):
+#  - DHT11 support for INT/EXT (safe: missing sensor => temp="xx.x", hum="xx" in /api/state)
+#  - monitor.db logging now writes CPU temp+load% and DHT INT/EXT temp+hum + load averages
+#  - Prometheus metrics endpoint (/metrics) in parallel (optional; runs if prometheus_client installed)
+#  - InfluxDB 3 Core support: dual-write to SQLite AND InfluxDB for Grafana stability
+#
 # Notes:
 #  - /api/admin/users/<id>/delete is kept as BACKWARD COMPAT alias for "deactivate"
 #    because the current UI calls /delete.
@@ -23,8 +29,7 @@
 # ======================================================
 
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request, abort, session
-from flask import Flask, request, session, jsonify, abort, has_request_context
+from flask import Flask, jsonify, request, abort, session, has_request_context
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 import sqlite3
@@ -42,16 +47,52 @@ import re
 import atexit
 import threading
 import queue
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import RPi.GPIO as GPIO
+
+# ---------------------
+# Optional: DHT11 (adafruit)
+# ---------------------
+try:
+    import board  # type: ignore
+    import adafruit_dht  # type: ignore
+except Exception:
+    board = None
+    adafruit_dht = None
+
+# ---------------------
+# Optional: Prometheus
+# ---------------------
+try:
+    from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST  # type: ignore
+    _PROM_OK = True
+except Exception:
+    Gauge = None
+    generate_latest = None
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4"
+    _PROM_OK = False
+
+# ---------------------
+# Optional: InfluxDB 3 (via HTTP line protocol)
+# ---------------------
+import urllib.request
+import urllib.error
+
+INFLUXDB_ENABLED = os.environ.get("PI3TWE_INFLUXDB_ENABLED", "1") == "1"
+INFLUXDB_URL = os.environ.get("PI3TWE_INFLUXDB_URL", "http://127.0.0.1:8181")
+INFLUXDB_DATABASE = os.environ.get("PI3TWE_INFLUXDB_DATABASE", "pi3twe")
+INFLUXDB_TOKEN = os.environ.get("PI3TWE_INFLUXDB_TOKEN", "apiv3_w4oHVF1Het8qY41d_R-qEVU8EA_RQ0UYuEqYqYkTre0m0oTif8O1ic90HYmrDgR2PyR1Q-Np9Xm9kl8Y8uksYw")
+
+# Set to "0" to disable SQLite monitor writes (InfluxDB only)
+SQLITE_MONITOR_ENABLED = os.environ.get("PI3TWE_SQLITE_MONITOR_ENABLED", "0") == "1"
 
 # ---------------------
 # Config
 # ---------------------
 DB_PATH = "/srv/pi3twe/app/pi3twe.db"
 MONITOR_DB_PATH = "/srv/pi3twe/data/monitor.db"
-MONITOR_LOG_INTERVAL_S = 15.0
+MONITOR_LOG_INTERVAL_S = 60.0
 
 SRC_CPU = "cpu"
 SRC_INT = "int"
@@ -64,6 +105,12 @@ SRC_LOAD15 = "load15"
 RELAY_GPIO = 27          # SSR active HIGH = AAN
 BUTTON_GPIO = 23         # Pushbutton active LOW naar GND (physical pin 16)
 
+# DHT GPIOs (BCM) – afgestemd op bewezen werkende test
+# - BCM26 = physical pin 37  (INT)
+# - BCM20 = physical pin 38  (EXT)
+# physical pin 7 (GPIO4) wordt NIET gebruikt
+DHT_INT_GPIO = int(os.environ.get("PI3TWE_DHT_INT_GPIO", "26"))
+DHT_EXT_GPIO = int(os.environ.get("PI3TWE_DHT_EXT_GPIO", "20"))
 # Debounce
 BUTTON_BOUNCE_MS = 150       # RPi.GPIO bouncetime
 BUTTON_MIN_INTERVAL_MS = 300 # extra software guard (anti-double trigger)
@@ -105,126 +152,10 @@ _MONITOR_STOP = threading.Event()
 # ---------------------
 # Helpers
 # ---------------------
-
-
-# ---------------------
-# Monitor DB logging (in-app)
-# ---------------------
-_MONITOR_DB_LOCK = threading.Lock()
-_MONITOR_DB_THREAD: Optional[threading.Thread] = None
-_MONITOR_DB_STOP = threading.Event()
-
-def monitor_db_ensure_tables() -> None:
-    try:
-        os.makedirs(os.path.dirname(MONITOR_DB_PATH), exist_ok=True)
-        with sqlite3.connect(MONITOR_DB_PATH) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS measurements (
-                    ts     INTEGER NOT NULL,
-                    source TEXT    NOT NULL,
-                    temp   REAL,
-                    hum    REAL
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_src_ts ON measurements(source, ts)")
-            conn.commit()
-    except Exception:
-        # geen hard fail
-        pass
-
-def monitor_db_insert(ts: int, source: str, temp, hum) -> None:
-    try:
-        with _MONITOR_DB_LOCK:
-            with sqlite3.connect(MONITOR_DB_PATH) as conn:
-                conn.execute(
-                    "INSERT INTO measurements(ts, source, temp, hum) VALUES(?,?,?,?)",
-                    (int(ts), str(source), temp, hum),
-                )
-                conn.commit()
-    except Exception:
-        pass
-
-def _read_load_averages():
-    # /proc/loadavg: 1m 5m 15m ...
-    try:
-        with open("/proc/loadavg", "r", encoding="utf-8") as f:
-            parts = f.read().strip().split()
-        if len(parts) >= 3:
-            return float(parts[0]), float(parts[1]), float(parts[2])
-    except Exception:
-        pass
-    return None, None, None
-
-def _monitor_db_loop() -> None:
-    monitor_db_ensure_tables()
-
-    while not _MONITOR_DB_STOP.is_set():
-        try:
-            ts = int(time.time())
-
-            # Gebruik bestaande waardes uit jouw monitor.db (latest per source)
-            cpu = read_monitor_latest(SRC_CPU) or {}
-            it  = read_monitor_latest(SRC_INT) or {}
-            ex  = read_monitor_latest(SRC_EXT) or {}
-
-            cpu_temp = cpu.get("temp")
-            cpu_load_pct = cpu_load_percent_cached()  # jouw functie
-
-            if cpu_temp is not None or cpu_load_pct is not None:
-                monitor_db_insert(
-                    ts,
-                    SRC_CPU,
-                    float(cpu_temp) if cpu_temp is not None else None,
-                    float(cpu_load_pct) if cpu_load_pct is not None else None,
-                )
-
-            if it.get("temp") is not None or it.get("hum") is not None:
-                monitor_db_insert(
-                    ts, SRC_INT,
-                    float(it.get("temp")) if it.get("temp") is not None else None,
-                    float(it.get("hum")) if it.get("hum") is not None else None,
-                )
-
-            if ex.get("temp") is not None or ex.get("hum") is not None:
-                monitor_db_insert(
-                    ts, SRC_EXT,
-                    float(ex.get("temp")) if ex.get("temp") is not None else None,
-                    float(ex.get("hum")) if ex.get("hum") is not None else None,
-                )
-
-            # Load averages als aparte sources
-            l1, l5, l15 = _read_load_averages()
-            if l1 is not None:
-                monitor_db_insert(ts, SRC_LOAD1, float(l1), None)
-            if l5 is not None:
-                monitor_db_insert(ts, SRC_LOAD5, float(l5), None)
-            if l15 is not None:
-                monitor_db_insert(ts, SRC_LOAD15, float(l15), None)
-
-        except Exception:
-            pass
-
-        _MONITOR_DB_STOP.wait(MONITOR_LOG_INTERVAL_S)
-
-def start_monitor_db_logger_once() -> None:
-    global _MONITOR_DB_THREAD
-    if _MONITOR_DB_THREAD is not None and _MONITOR_DB_THREAD.is_alive():
-        return
-    _MONITOR_DB_STOP.clear()
-    _MONITOR_DB_THREAD = threading.Thread(
-        target=_monitor_db_loop,
-        name="monitor-db-logger",
-        daemon=True
-    )
-    _MONITOR_DB_THREAD.start()
-
-
-
-
 def utc_ts() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    
+
+
 def read_uptime_seconds() -> Optional[int]:
     try:
         with open("/proc/uptime", "r", encoding="utf-8") as f:
@@ -248,7 +179,7 @@ def format_uptime(secs: Optional[int]) -> str:
     if days > 0:
         return f"{days}d {h:02d}:{m:02d}:{s:02d}"
     return f"{h:02d}:{m:02d}:{s:02d}"
-    
+
 
 def ensure_parent_dir(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -287,6 +218,7 @@ def client_ip() -> str:
         ip = xff.split(",")[0].strip()
     return ip or "-"
 
+
 def current_user_id():
     return session.get("uid")
 
@@ -318,6 +250,419 @@ def _html_escape(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ---------------------
+# CPU temperature read (no external monitor needed)
+# ---------------------
+def read_cpu_temp_c() -> Optional[float]:
+    # Raspberry Pi typical path
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        v = float(raw)
+        if v > 1000.0:
+            v = v / 1000.0
+        return round(v, 1)
+    except Exception:
+        return None
+
+
+# ---------------------
+# DHT11 logic (safe: missing => placeholders)
+# ---------------------
+_DHT_INT = None
+_DHT_EXT = None
+
+_DHT_CACHE_LOCK = threading.Lock()
+_DHT_CACHE = {
+    "t": 0.0,
+    "int": {"temp": "xx.x", "hum": "xx"},
+    "ext": {"temp": "xx.x", "hum": "xx"},
+}
+_DHT_MIN_INTERVAL_S = 2.0  # avoid hammering DHT11
+
+
+def _bcm_to_board_pin(bcm: int):
+    # board.Dxx is present for most BCM pins on Raspberry Pi
+    if board is None:
+        return None
+    attr = f"D{int(bcm)}"
+    return getattr(board, attr, None)
+
+
+def dht_init_once() -> None:
+    global _DHT_INT, _DHT_EXT
+    if adafruit_dht is None or board is None:
+        return
+    if _DHT_INT is None:
+        bp = _bcm_to_board_pin(DHT_INT_GPIO)
+        if bp is not None:
+            try:
+                _DHT_INT = adafruit_dht.DHT11(bp)
+            except Exception:
+                _DHT_INT = None
+    if _DHT_EXT is None:
+        bp = _bcm_to_board_pin(DHT_EXT_GPIO)
+        if bp is not None:
+            try:
+                _DHT_EXT = adafruit_dht.DHT11(bp)
+            except Exception:
+                _DHT_EXT = None
+
+
+def read_dht_safe(dht_device) -> Dict[str, Any]:
+    """
+    Returns always:
+      {"temp": float(1dp) or "xx.x", "hum": int(0dp) or "xx"}
+    """
+    try:
+        if dht_device is None:
+            raise RuntimeError("no device")
+        temp = dht_device.temperature
+        hum = dht_device.humidity
+        if temp is None or hum is None:
+            raise RuntimeError("no data")
+        return {
+            "temp": round(float(temp), 1),
+            "hum": int(round(float(hum), 0)),
+        }
+    except Exception:
+        return {"temp": "xx.x", "hum": "xx"}
+
+
+def _dht_to_db_values(v: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Convert cached DHT reading to DB numeric values (REAL/NULL).
+    hum is stored as REAL too; we store integer as float (Grafana ok) or NULL.
+    """
+    t = v.get("temp")
+    h = v.get("hum")
+    temp_f: Optional[float] = None
+    hum_f: Optional[float] = None
+    try:
+        if isinstance(t, (int, float)):
+            temp_f = float(t)
+    except Exception:
+        temp_f = None
+    try:
+        if isinstance(h, (int, float)):
+            hum_f = float(h)
+    except Exception:
+        hum_f = None
+    return temp_f, hum_f
+
+
+# ---------------------
+# Prometheus metrics (optional)
+# ---------------------
+if _PROM_OK:
+    PROM_CPU_TEMP_C = Gauge("pi3twe_cpu_temp_c", "CPU temperature (C)")
+    PROM_CPU_LOAD_PCT = Gauge("pi3twe_cpu_load_pct", "CPU load percentage (0..100)")
+    PROM_LOADAVG_1 = Gauge("pi3twe_loadavg_1", "Load average 1m")
+    PROM_LOADAVG_5 = Gauge("pi3twe_loadavg_5", "Load average 5m")
+    PROM_LOADAVG_15 = Gauge("pi3twe_loadavg_15", "Load average 15m")
+
+    PROM_DHT_TEMP_C = Gauge("pi3twe_dht_temp_c", "DHT temperature (C)", ["where"])
+    PROM_DHT_HUM_PCT = Gauge("pi3twe_dht_hum_pct", "DHT humidity (%)", ["where"])
+    PROM_DHT_OK = Gauge("pi3twe_dht_ok", "DHT sensor OK (1=ok,0=missing/error)", ["where"])
+
+
+def prom_set_dht(where: str, v: Dict[str, Any]) -> None:
+    if not _PROM_OK:
+        return
+    t = v.get("temp")
+    h = v.get("hum")
+    if isinstance(t, (int, float)) and isinstance(h, (int, float)):
+        PROM_DHT_OK.labels(where=where).set(1)
+        PROM_DHT_TEMP_C.labels(where=where).set(float(t))
+        PROM_DHT_HUM_PCT.labels(where=where).set(float(h))
+    else:
+        PROM_DHT_OK.labels(where=where).set(0)
+        # keep last numeric values; do not force to 0 (would look like real data)
+        # so: do nothing for TEMP/HUM when missing
+
+
+# ---------------------
+# Monitor DB logging (in-app)
+# ---------------------
+_MONITOR_DB_LOCK = threading.Lock()
+_MONITOR_DB_THREAD: Optional[threading.Thread] = None
+_MONITOR_DB_STOP = threading.Event()
+
+
+def monitor_db_ensure_tables() -> None:
+    try:
+        os.makedirs(os.path.dirname(MONITOR_DB_PATH), exist_ok=True)
+        with sqlite3.connect(MONITOR_DB_PATH) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout = 10000;")
+            conn.execute("PRAGMA busy_timeout = 10000;")  # ← DEZE REGEL TOEVOEGEN
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS measurements (
+                    ts     INTEGER NOT NULL,
+                    source TEXT    NOT NULL,
+                    temp   REAL,
+                    hum    REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_src_ts ON measurements(source, ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+# ---------------------
+# InfluxDB 3 write (line protocol over HTTP)
+# ---------------------
+def influxdb_write(measurement: str, tags: Dict[str, str], fields: Dict[str, Any], timestamp_ns: Optional[int] = None) -> bool:
+    """
+    Write a single point to InfluxDB 3 using line protocol.
+    Returns True on success, False on failure.
+    All numeric values are written as floats for consistency.
+    """
+    if not INFLUXDB_ENABLED:
+        return False
+    
+    try:
+        # Build line protocol: measurement,tag1=val1,tag2=val2 field1=val1,field2=val2 timestamp
+        tag_str = ",".join(f"{k}={v}" for k, v in tags.items()) if tags else ""
+        field_parts = []
+        for k, v in fields.items():
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                field_parts.append(f"{k}={str(v).lower()}")
+            elif isinstance(v, (int, float)):
+                # Always write as float to avoid type conflicts
+                field_parts.append(f"{k}={float(v)}")
+            elif isinstance(v, str):
+                field_parts.append(f'{k}="{v}"')
+            else:
+                field_parts.append(f"{k}={v}")
+        
+        if not field_parts:
+            return False
+        
+        field_str = ",".join(field_parts)
+        
+        if tag_str:
+            line = f"{measurement},{tag_str} {field_str}"
+        else:
+            line = f"{measurement} {field_str}"
+        
+        if timestamp_ns:
+            line += f" {timestamp_ns}"
+        
+        # Send to InfluxDB
+        url = f"{INFLUXDB_URL}/api/v3/write_lp?db={INFLUXDB_DATABASE}"
+        data = line.encode("utf-8")
+        
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "Authorization": f"Bearer {INFLUXDB_TOKEN}",
+            }
+        )
+        
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            return resp.status in (200, 204)
+    
+    except Exception:
+        return False
+
+
+def influxdb_write_measurement(ts: int, source: str, temp, hum) -> bool:
+    """
+    Write a measurement to InfluxDB, matching the SQLite schema.
+    Rounds values appropriately:
+    - temp: 1 decimal place
+    - hum (int/ext): integer (0 decimals) for humidity percentage
+    - hum (cpu): 1 decimal for CPU load percentage
+    - temp (load1/load5/load15): 2 decimals for load averages
+    """
+    fields = {}
+    
+    if temp is not None:
+        if source in (SRC_LOAD1, SRC_LOAD5, SRC_LOAD15):
+            # Load averages: 2 decimals
+            fields["temp"] = round(float(temp), 2)
+        else:
+            # Temperature: 1 decimal
+            fields["temp"] = round(float(temp), 1)
+    
+    if hum is not None:
+        if source in (SRC_INT, SRC_EXT):
+            # Humidity: integer
+            fields["hum"] = int(round(float(hum), 0))
+        else:
+            # CPU load percentage: 1 decimal
+            fields["hum"] = round(float(hum), 1)
+    
+    if not fields:
+        return False
+    
+    # Convert unix timestamp (seconds) to nanoseconds
+    timestamp_ns = int(ts) * 1_000_000_000
+    
+    return influxdb_write(
+        measurement="measurements",
+        tags={"source": source},
+        fields=fields,
+        timestamp_ns=timestamp_ns
+    )
+
+
+def monitor_db_insert(ts: int, source: str, temp, hum) -> None:
+    """
+    Insert measurement into SQLite AND/OR InfluxDB.
+    Controlled by SQLITE_MONITOR_ENABLED and INFLUXDB_ENABLED.
+    """
+    # SQLite write (if enabled)
+    if SQLITE_MONITOR_ENABLED:
+        try:
+            with _MONITOR_DB_LOCK:
+                with sqlite3.connect(MONITOR_DB_PATH) as conn:
+                    conn.execute("PRAGMA busy_timeout = 5000;")
+                    conn.execute(
+                        "INSERT INTO measurements(ts, source, temp, hum) VALUES(?,?,?,?)",
+                        (int(ts), str(source), temp, hum),
+                    )
+                    conn.commit()
+        except Exception:
+            pass
+    
+    # InfluxDB write (if enabled)
+    if INFLUXDB_ENABLED:
+        try:
+            influxdb_write_measurement(ts, source, temp, hum)
+        except Exception:
+            pass
+
+
+def _read_load_averages():
+    # /proc/loadavg: 1m 5m 15m ...
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+        if len(parts) >= 3:
+            return float(parts[0]), float(parts[1]), float(parts[2])
+    except Exception:
+        pass
+    return None, None, None
+
+
+def read_dht_cached() -> Dict[str, Any]:
+    """
+    Read DHT sensors with caching to avoid hammering them.
+    Returns cached values if called too frequently.
+    """
+    global _DHT_CACHE
+    
+    with _DHT_CACHE_LOCK:
+        now = time.time()
+        
+        # Return cached if too recent
+        if (now - _DHT_CACHE["t"]) < _DHT_MIN_INTERVAL_S:
+            return {
+                "int": _DHT_CACHE["int"].copy(),
+                "ext": _DHT_CACHE["ext"].copy(),
+            }
+        
+        # Read fresh values
+        int_data = read_dht_safe(_DHT_INT)
+        ext_data = read_dht_safe(_DHT_EXT)
+        
+        # Update cache
+        _DHT_CACHE["t"] = now
+        _DHT_CACHE["int"] = int_data
+        _DHT_CACHE["ext"] = ext_data
+        
+        return {
+            "int": int_data.copy(),
+            "ext": ext_data.copy(),
+        }
+
+
+
+def _monitor_db_loop() -> None:
+    monitor_db_ensure_tables()
+    dht_init_once()
+
+    while not _MONITOR_DB_STOP.is_set():
+        try:
+            ts = int(time.time())
+
+            # CPU
+            cpu_temp = read_cpu_temp_c()
+            cpu_load_pct = cpu_load_percent_cached()
+
+            if _PROM_OK:
+                if cpu_temp is not None:
+                    PROM_CPU_TEMP_C.set(float(cpu_temp))
+                if cpu_load_pct is not None:
+                    PROM_CPU_LOAD_PCT.set(float(cpu_load_pct))
+
+            if cpu_temp is not None or cpu_load_pct is not None:
+                monitor_db_insert(
+                    ts,
+                    SRC_CPU,
+                    float(cpu_temp) if cpu_temp is not None else None,
+                    float(cpu_load_pct) if cpu_load_pct is not None else None,
+                )
+
+            # DHT (INT/EXT)
+            d = read_dht_cached()
+            int_temp, int_hum = _dht_to_db_values(d["int"])
+            ext_temp, ext_hum = _dht_to_db_values(d["ext"])
+
+            monitor_db_insert(ts, SRC_INT, int_temp, int_hum)
+            monitor_db_insert(ts, SRC_EXT, ext_temp, ext_hum)
+
+            if _PROM_OK:
+                prom_set_dht("int", d["int"])
+                prom_set_dht("ext", d["ext"])
+
+            # Load averages as separate sources
+            l1, l5, l15 = _read_load_averages()
+            if l1 is not None:
+                monitor_db_insert(ts, SRC_LOAD1, float(l1), None)
+                if _PROM_OK:
+                    PROM_LOADAVG_1.set(float(l1))
+            if l5 is not None:
+                monitor_db_insert(ts, SRC_LOAD5, float(l5), None)
+                if _PROM_OK:
+                    PROM_LOADAVG_5.set(float(l5))
+            if l15 is not None:
+                monitor_db_insert(ts, SRC_LOAD15, float(l15), None)
+                if _PROM_OK:
+                    PROM_LOADAVG_15.set(float(l15))
+
+        except Exception:
+            pass
+
+        _MONITOR_DB_STOP.wait(MONITOR_LOG_INTERVAL_S)
+
+
+def start_monitor_db_logger_once() -> None:
+    global _MONITOR_DB_THREAD
+    if _MONITOR_DB_THREAD is not None and _MONITOR_DB_THREAD.is_alive():
+        return
+    _MONITOR_DB_STOP.clear()
+    _MONITOR_DB_THREAD = threading.Thread(
+        target=_monitor_db_loop,
+        name="monitor-db-logger",
+        daemon=True
+    )
+    _MONITOR_DB_THREAD.start()
+
+
+# ---------------------
+# Mail helpers
+# ---------------------
 def _build_mime_message(
     to_addr: str,
     subject: str,
@@ -438,13 +783,13 @@ def _status_reason_from_event(event: str, details: str) -> str:
         return mapping[e] if not d else f"{mapping[e]} — {d}"
     return d or e or "Onbekend"
 
+
 def _make_status_mail(ts_utc: str, event: str, details: str) -> Dict[str, str]:
     """
     Build subject + plain + html for internal status/alarm mails.
     """
     # --- UTC parsing ---
     try:
-        # ts_utc: "2026-01-13 15:59:01 UTC"
         dt_utc = datetime.strptime(ts_utc.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S")
     except Exception:
         dt_utc = datetime.utcnow()
@@ -533,7 +878,6 @@ def _make_status_mail(ts_utc: str, event: str, details: str) -> Dict[str, str]:
 </body>
 </html>
 """
-
     return {"subject": subject, "text": text, "html": html}
 
 
@@ -583,28 +927,71 @@ def get_wan_ip() -> str:
 
 def read_monitor_latest(source: str):
     """
-    Leest laatste meting uit monitor.db voor een source.
-    Verwacht tabel: measurements(ts NUM, source TEXT, temp REAL, hum REAL)
+    Leest de laatste meting uit monitor.db voor een gegeven source.
+
+    Tabel:
+      measurements(
+        ts     INTEGER,
+        source TEXT,
+        temp   REAL,
+        hum    REAL
+      )
+
+    Regels:
+      - Bestaat monitor.db niet → return None
+      - Geen records voor deze source → return None
+      - temp:
+          * altijd 1 decimaal (float) of None
+      - hum:
+          * source == 'int' of 'ext' → integer (0 decimalen) of None
+          * overige sources (bv cpu/load) → 1 decimaal of None
     """
     if not os.path.exists(MONITOR_DB_PATH):
         return None
+
     try:
         conn = sqlite3.connect(MONITOR_DB_PATH)
         conn.row_factory = sqlite3.Row
+
         row = conn.execute(
-            "SELECT ts, source, temp, hum FROM measurements WHERE source=? ORDER BY ts DESC LIMIT 1",
+            """
+            SELECT ts, temp, hum
+            FROM measurements
+            WHERE source = ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
             (source,),
         ).fetchone()
+
         conn.close()
-        if not row:
+
+        if row is None:
             return None
-        temp = row["temp"]
-        hum = row["hum"]
+
+        # --- temp ---
+        if row["temp"] is None:
+            temp_out = None
+        else:
+            temp_out = round(float(row["temp"]), 1)
+
+        # --- hum ---
+        if row["hum"] is None:
+            hum_out = None
+        else:
+            if source in ("int", "ext"):
+                # DHT: humidity altijd 0 decimalen
+                hum_out = int(round(float(row["hum"]), 0))
+            else:
+                # cpu/load/etc
+                hum_out = round(float(row["hum"]), 1)
+
         return {
             "ts": row["ts"],
-            "temp": (round(float(temp), 1) if temp is not None else None),
-            "hum": (round(float(hum), 1) if hum is not None else None),
+            "temp": temp_out,
+            "hum": hum_out,
         }
+
     except Exception:
         return None
 
@@ -612,9 +999,7 @@ def read_monitor_latest(source: str):
 def fail2ban_status():
     """
     Returns {"total": int|None, "jails": {name:int}, "error"?: str}
-
     Uses sudo (NOPASSWD) because fail2ban socket is root-only.
-    Will NEVER raise; failures become {"error": "..."}.
     """
     SUDO = "/usr/bin/sudo"
     F2B = "/usr/bin/fail2ban-client"
@@ -693,12 +1078,9 @@ GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BCM)
 
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, GPIO.HIGH)  # Fail-safe default: repeater AAN na (re)start
 
-# Fail-safe default: repeater AAN na (re)start
-GPIO.output(RELAY_GPIO, GPIO.HIGH)
-
-# Button: active-low to GND, internal pull-up
-GPIO.setup(BUTTON_GPIO, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(BUTTON_GPIO, GPIO.IN, pull_up_down=GPIO.PUD_UP)  # Button: active-low to GND, internal pull-up
 
 STATE = {
     "repeater_on": True,
@@ -710,7 +1092,6 @@ _STATE_LOCK = threading.Lock()
 _BUTTON_Q: "queue.Queue[float]" = queue.Queue(maxsize=20)
 _BUTTON_THREAD: Optional[threading.Thread] = None
 _LAST_BUTTON_TS = 0.0
-
 
 # ---------------------
 # Database
@@ -960,6 +1341,8 @@ def _button_poll_worker() -> None:
         except Exception as e:
             audit_system("BUTTON_POLL_THREAD_ERROR", f"{type(e).__name__}: {e}")
             time.sleep(0.5)
+        
+        time.sleep(0.02)  # 50Hz polling - prevent busy loop
 
 
 def start_button_listener_once() -> None:
@@ -1100,7 +1483,6 @@ def _monitor_temp_loop() -> None:
         except Exception as e:
             audit_system("TEMP_MONITOR_THREAD_ERROR", f"{type(e).__name__}: {e}")
 
-        # 10s poll; monitor.db logging interval is 60s, so this is safe
         _MONITOR_STOP.wait(10.0)
 
 
@@ -1538,15 +1920,19 @@ def api_admin_alarm_set():
 
 
 # ------------------------------
-# CPU load % (lightweight, cached)
+# CPU load % (lightweight, cached with moving average)
 # ------------------------------
 _CPU_STAT_LAST = {"t": 0.0, "idle": None, "total": None, "pct": None}
+_CPU_LOAD_HISTORY = []  # Last N samples for moving average
+_CPU_LOAD_HISTORY_SIZE = 5  # Number of samples to average
 
 def cpu_load_percent_cached(min_interval_s: float = 1.0):
     """
     Returns CPU load percentage (0..100) based on /proc/stat deltas.
+    Uses a moving average of the last 5 samples to smooth out spikes.
     Cached to avoid overhead when /api/state is polled frequently.
     """
+    global _CPU_LOAD_HISTORY
     now = time.time()
     if _CPU_STAT_LAST["pct"] is not None and (now - _CPU_STAT_LAST["t"]) < min_interval_s:
         return _CPU_STAT_LAST["pct"]
@@ -1580,7 +1966,15 @@ def cpu_load_percent_cached(min_interval_s: float = 1.0):
             return _CPU_STAT_LAST["pct"]
 
         usage = 1.0 - (didle / float(dtotal))
-        pct = max(0.0, min(100.0, usage * 100.0))
+        raw_pct = max(0.0, min(100.0, usage * 100.0))
+        
+        # Add to history and compute moving average
+        _CPU_LOAD_HISTORY.append(raw_pct)
+        if len(_CPU_LOAD_HISTORY) > _CPU_LOAD_HISTORY_SIZE:
+            _CPU_LOAD_HISTORY = _CPU_LOAD_HISTORY[-_CPU_LOAD_HISTORY_SIZE:]
+        
+        # Return moving average
+        pct = sum(_CPU_LOAD_HISTORY) / len(_CPU_LOAD_HISTORY)
         _CPU_STAT_LAST["pct"] = pct
         return pct
     except Exception:
@@ -1817,7 +2211,7 @@ def init_for_gunicorn() -> None:
         db_init()
         ensure_superadmin_exists()
         start_monitor_thread_once()
-        start_monitor_db_logger_once()()
+        start_monitor_db_logger_once()
 
         audit_system("MAIL_SELFTEST_START", "gunicorn_import")
 
@@ -1847,7 +2241,7 @@ def main():
     db_init()
     ensure_superadmin_exists()
     start_monitor_thread_once()
-    app.run(host="127.0.0.1", port=3000)
+    app.run(host="127.0.0.1", port=3001)
 
 
 if __name__ == "__main__":

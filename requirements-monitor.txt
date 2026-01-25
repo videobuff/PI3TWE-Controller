@@ -1,7 +1,0 @@
-# File: requirements-monitor.txt
-# Generated: 2026-01-04
-# Description: Dependencies voor FastAPI monitor web.
-
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-jinja2==3.1.4
