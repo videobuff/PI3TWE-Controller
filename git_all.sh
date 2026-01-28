@@ -55,7 +55,7 @@ git commit -m "$MSG"
 
 echo
 echo -e "${YELLOW}=== Git push ===${NC}"
-git push
+git push --follow-tags
 
 echo
 echo -e "${GREEN}✓ Klaar!${NC}"

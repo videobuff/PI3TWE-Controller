@@ -78,10 +78,11 @@ except Exception:
 # ---------------------
 import urllib.request
 import urllib.error
+import json
 
 INFLUXDB_ENABLED = os.environ.get("PI3TWE_INFLUXDB_ENABLED", "1") == "1"
 INFLUXDB_URL = os.environ.get("PI3TWE_INFLUXDB_URL", "http://127.0.0.1:8181")
-INFLUXDB_DATABASE = os.environ.get("PI3TWE_INFLUXDB_DATABASE", "pi3twe")
+INFLUXDB_DATABASE = os.environ.get("PI3TWE_INFLUXDB_DATABASE", "monitor")
 
 # Token from environment or secrets file (never hardcode!)
 def _load_influxdb_token():
@@ -98,7 +99,7 @@ def _load_influxdb_token():
 INFLUXDB_TOKEN = _load_influxdb_token()
 
 # Set to "0" to disable SQLite monitor writes (InfluxDB only)
-SQLITE_MONITOR_ENABLED = os.environ.get("PI3TWE_SQLITE_MONITOR_ENABLED", "1") == "1"
+SQLITE_MONITOR_ENABLED = os.environ.get("PI3TWE_SQLITE_MONITOR_ENABLED", "0") == "1"
 
 # ---------------------
 # Config
@@ -284,17 +285,98 @@ def read_cpu_temp_c() -> Optional[float]:
 # ---------------------
 # DHT11 logic (safe: missing => placeholders)
 # ---------------------
+_DHT_INT = None
+_DHT_EXT = None
+
+_DHT_CACHE_LOCK = threading.Lock()
+_DHT_CACHE = {
+    "t": 0.0,
+    "int": {"temp": "xx.x", "hum": "xx"},
+    "ext": {"temp": "xx.x", "hum": "xx"},
+}
+_DHT_MIN_INTERVAL_S = 2.0  # avoid hammering DHT11
 
 
+def _bcm_to_board_pin(bcm: int):
+    # board.Dxx is present for most BCM pins on Raspberry Pi
+    if board is None:
+        return None
+    attr = f"D{int(bcm)}"
+    return getattr(board, attr, None)
 
 
 def dht_init_once() -> None:
-    """DHT disabled - using dht_logger.py instead"""
-    pass
+    global _DHT_INT, _DHT_EXT
+    # Gebruik BCM pin-nummers direct (zoals tools/dht_test.py).
+    # Dit is robuuster dan board.Dxx mapping; sommige board builds hebben niet alle Dxx attributen.
+    if adafruit_dht is None:
+        return
+    if _DHT_INT is None:
+        try:
+            _DHT_INT = adafruit_dht.DHT11(DHT_INT_GPIO)
+        except Exception:
+            _DHT_INT = None
+    if _DHT_EXT is None:
+        try:
+            _DHT_EXT = adafruit_dht.DHT11(DHT_EXT_GPIO)
+        except Exception:
+            _DHT_EXT = None
+
+def read_dht_safe(dht_device) -> Dict[str, Any]:
+    """
+    Returns always:
+      {"temp": float(1dp) or "xx.x", "hum": int(0dp) or "xx"}
+    """
+    try:
+        if dht_device is None:
+            raise RuntimeError("no device")
+        temp = dht_device.temperature
+        hum = dht_device.humidity
+        if temp is None or hum is None:
+            raise RuntimeError("no data")
+        return {
+            "temp": round(float(temp), 1),
+            "hum": int(round(float(hum), 0)),
+        }
+    except Exception:
+        # Bij fouten: probeer het device netjes te sluiten en forceer her-init in de volgende loop.
+        try:
+            if dht_device is not None and hasattr(dht_device, 'exit'):
+                dht_device.exit()
+        except Exception:
+            pass
+        # Reset de globale handle die bij dit object hoort
+        global _DHT_INT, _DHT_EXT
+        try:
+            if dht_device is _DHT_INT:
+                _DHT_INT = None
+            elif dht_device is _DHT_EXT:
+                _DHT_EXT = None
+        except Exception:
+            pass
+        return {"temp": "xx.x", "hum": "xx"}
 
 
-
-
+def _dht_to_db_values(v: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Convert cached DHT reading to DB numeric values (REAL/NULL).
+    hum is stored as REAL too; we store integer as float (Grafana ok) or NULL.
+    """
+    t = v.get("temp")
+    h = v.get("hum")
+    temp_f: Optional[float] = None
+    hum_f: Optional[float] = None
+    try:
+        if isinstance(t, (int, float)):
+            temp_f = float(t)
+    except Exception:
+        temp_f = None
+    try:
+        if isinstance(h, (int, float)):
+            hum_f = float(h)
+    except Exception:
+        hum_f = None
+    return temp_f, hum_f
 
 
 # ---------------------
@@ -364,59 +446,73 @@ def influxdb_write(measurement: str, tags: Dict[str, str], fields: Dict[str, Any
     Write a single point to InfluxDB 3 using line protocol.
     Returns True on success, False on failure.
     All numeric values are written as floats for consistency.
+    Retries on WAL conflicts (max 3 attempts with 50ms backoff).
     """
     if not INFLUXDB_ENABLED:
         return False
     
-    try:
-        # Build line protocol: measurement,tag1=val1,tag2=val2 field1=val1,field2=val2 timestamp
-        tag_str = ",".join(f"{k}={v}" for k, v in tags.items()) if tags else ""
-        field_parts = []
-        for k, v in fields.items():
-            if v is None:
-                continue
-            if isinstance(v, bool):
-                field_parts.append(f"{k}={str(v).lower()}")
-            elif isinstance(v, (int, float)):
-                # Always write as float to avoid type conflicts
-                field_parts.append(f"{k}={float(v)}")
-            elif isinstance(v, str):
-                field_parts.append(f'{k}="{v}"')
-            else:
-                field_parts.append(f"{k}={v}")
+    # Build line protocol once
+    tag_str = ",".join(f"{k}={v}" for k, v in tags.items()) if tags else ""
+    field_parts = []
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            field_parts.append(f"{k}={str(v).lower()}")
+        elif isinstance(v, (int, float)):
+            field_parts.append(f"{k}={float(v)}")
+        elif isinstance(v, str):
+            field_parts.append(f'{k}="{v}"')
+        else:
+            field_parts.append(f"{k}={v}")
+    
+    if not field_parts:
+        return False
+    
+    field_str = ",".join(field_parts)
+    if tag_str:
+        line = f"{measurement},{tag_str} {field_str}"
+    else:
+        line = f"{measurement} {field_str}"
+    if timestamp_ns:
+        line += f" {timestamp_ns}"
+    
+    url = f"{INFLUXDB_URL}/api/v3/write_lp?db={INFLUXDB_DATABASE}"
+    data = line.encode("utf-8")
+    
+    # Retry loop for WAL conflicts
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                method="POST",
+                headers={
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Authorization": f"Bearer {INFLUXDB_TOKEN}",
+                }
+            )
+            
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                return resp.status in (200, 204)
         
-        if not field_parts:
+        except urllib.error.HTTPError as e:
+            # Check if WAL conflict
+            if e.code in (500, 503):
+                try:
+                    body = e.read().decode('utf-8', errors='ignore')
+                    if 'wal' in body.lower() or 'another process' in body.lower():
+                        if attempt < 2:  # Don't sleep on last attempt
+                            time.sleep(0.05 * (attempt + 1))  # 50ms, 100ms
+                            continue
+                except:
+                    pass
             return False
         
-        field_str = ",".join(field_parts)
-        
-        if tag_str:
-            line = f"{measurement},{tag_str} {field_str}"
-        else:
-            line = f"{measurement} {field_str}"
-        
-        if timestamp_ns:
-            line += f" {timestamp_ns}"
-        
-        # Send to InfluxDB
-        url = f"{INFLUXDB_URL}/api/v3/write_lp?db={INFLUXDB_DATABASE}"
-        data = line.encode("utf-8")
-        
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Content-Type": "text/plain; charset=utf-8",
-                "Authorization": f"Bearer {INFLUXDB_TOKEN}",
-            }
-        )
-        
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            return resp.status in (200, 204)
+        except Exception:
+            return False
     
-    except Exception:
-        return False
+    return False
 
 
 def influxdb_write_measurement(ts: int, source: str, temp, hum) -> bool:
@@ -460,6 +556,84 @@ def influxdb_write_measurement(ts: int, source: str, temp, hum) -> bool:
     )
 
 
+
+# ---------------------
+# InfluxDB: repeater state/event logging (AAN/UIT + actor/user context)
+# ---------------------
+_REPEATER_BOOT_LOGGED = False
+
+def _now_ns() -> int:
+    return int(time.time() * 1_000_000_000)
+
+def _current_actor_username() -> str:
+    """Return username if request context + logged in, else 'local_machine'."""
+    try:
+        if not has_request_context():
+            return "local_machine"
+        uid = session.get("uid")
+        if not uid:
+            return "local_machine"
+        with db() as c:
+            row = c.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()
+        if row and row["username"]:
+            return str(row["username"])
+    except Exception:
+        pass
+    return "local_machine"
+
+def influx_log_repeater_state_event(
+    state_on: bool,
+    event: str,
+    reason: str,
+    source: str,
+    actor: str = "",
+    client_ip_str: str = "",
+    message: str = "",
+) -> None:
+    """Write repeater state + event to InfluxDB (low-cardinality tags)."""
+    if not INFLUXDB_ENABLED:
+        return
+    try:
+        a = (actor or _current_actor_username() or "local_machine").strip() or "local_machine"
+        ipf = (client_ip_str or (client_ip() if has_request_context() else "-")).strip() or "-"
+        st = 1 if bool(state_on) else 0
+        ts = _now_ns()
+
+        # State timeline point
+        influxdb_write(
+            measurement="repeater_state",
+            tags={
+                "actor": a,
+                "reason": (reason or "unknown"),
+                "source": (source or "unknown"),
+            },
+            fields={
+                "state": float(st),
+            },
+            timestamp_ns=ts,
+        )
+
+        # Audit/event point (IP as FIELD, not tag)
+        influxdb_write(
+            measurement="repeater_event",
+            tags={
+                "event": (event or "unknown"),
+                "actor": a,
+                "reason": (reason or "unknown"),
+                "source": (source or "unknown"),
+            },
+            fields={
+                "state": float(st),
+                "client_ip": str(ipf),
+                "message": str(message or ""),
+            },
+            timestamp_ns=ts,
+        )
+    except Exception:
+        pass
+
+
+
 def monitor_db_insert(ts: int, source: str, temp, hum) -> None:
     """
     Insert measurement into SQLite AND/OR InfluxDB.
@@ -499,11 +673,42 @@ def _read_load_averages():
     return None, None, None
 
 
+def read_dht_cached() -> Dict[str, Any]:
+    """
+    Read DHT sensors with caching to avoid hammering them.
+    Returns cached values if called too frequently.
+    """
+    global _DHT_CACHE
+    
+    with _DHT_CACHE_LOCK:
+        now = time.time()
+        
+        # Return cached if too recent
+        if (now - _DHT_CACHE["t"]) < _DHT_MIN_INTERVAL_S:
+            return {
+                "int": _DHT_CACHE["int"].copy(),
+                "ext": _DHT_CACHE["ext"].copy(),
+            }
+        
+        # Read fresh values
+        int_data = read_dht_safe(_DHT_INT)
+        ext_data = read_dht_safe(_DHT_EXT)
+        
+        # Update cache
+        _DHT_CACHE["t"] = now
+        _DHT_CACHE["int"] = int_data
+        _DHT_CACHE["ext"] = ext_data
+        
+        return {
+            "int": int_data.copy(),
+            "ext": ext_data.copy(),
+        }
 
 
 
-def _monitor_db_loop_DISABLED() -> None:
+def _monitor_db_loop() -> None:
     monitor_db_ensure_tables()
+    dht_init_once()
 
     while not _MONITOR_DB_STOP.is_set():
         try:
@@ -527,6 +732,18 @@ def _monitor_db_loop_DISABLED() -> None:
                     float(cpu_load_pct) if cpu_load_pct is not None else None,
                 )
 
+            # DHT (INT/EXT)
+            d = read_dht_cached()
+            int_temp, int_hum = _dht_to_db_values(d["int"])
+            ext_temp, ext_hum = _dht_to_db_values(d["ext"])
+
+            monitor_db_insert(ts, SRC_INT, int_temp, int_hum)
+            monitor_db_insert(ts, SRC_EXT, ext_temp, ext_hum)
+
+            if _PROM_OK:
+                prom_set_dht("int", d["int"])
+                prom_set_dht("ext", d["ext"])
+
             # Load averages as separate sources
             l1, l5, l15 = _read_load_averages()
             if l1 is not None:
@@ -548,7 +765,7 @@ def _monitor_db_loop_DISABLED() -> None:
         _MONITOR_DB_STOP.wait(MONITOR_LOG_INTERVAL_S)
 
 
-def start_monitor_db_logger_once_DISABLED() -> None:
+def start_monitor_db_logger_once() -> None:
     global _MONITOR_DB_THREAD
     if _MONITOR_DB_THREAD is not None and _MONITOR_DB_THREAD.is_alive():
         return
@@ -826,73 +1043,123 @@ def get_wan_ip() -> str:
     return _WAN_CACHE["ip"] or ""
 
 
+def _influxdb_query_sql(q: str) -> list:
+    """
+    Query InfluxDB 3 Core SQL endpoint and return a list of rows (dicts).
+    Uses /api/v3/query_sql with JSON payload {"db": ..., "q": ...}.
+    """
+    if not INFLUXDB_ENABLED:
+        return []
+    try:
+        url = f"{INFLUXDB_URL}/api/v3/query_sql"
+        payload = json.dumps({"db": INFLUXDB_DATABASE, "q": q}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {INFLUXDB_TOKEN}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        obj = json.loads(raw) if raw else {}
+        if isinstance(obj, dict):
+            data = obj.get("data")
+            if isinstance(data, list):
+                return [r for r in data if isinstance(r, dict)]
+            return []
+        if isinstance(obj, list):
+            return [r for r in obj if isinstance(r, dict)]
+    except Exception:
+        return []
+    return []
+
+
+def _parse_influx_time_to_unix_s(v) -> Optional[int]:
+    """Parse InfluxDB 'time' field to unix seconds."""
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            if v > 1e14:
+                return int(v / 1e9)
+            if v > 1e11:
+                return int(v / 1e6)
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            s = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s)
+            return int(dt.timestamp())
+    except Exception:
+        return None
+    return None
+
+
 def read_monitor_latest(source: str):
     """
-    Leest de laatste meting uit monitor.db voor een gegeven source.
+    Leest de laatste meting voor een gegeven source.
 
-    Tabel:
-      measurements(
-        ts     INTEGER,
-        source TEXT,
-        temp   REAL,
-        hum    REAL
-      )
+    Bronkeuze:
+      - Als SQLITE_MONITOR_ENABLED == True én monitor.db bestaat -> SQLite (legacy)
+      - Anders -> InfluxDB 3 Core (query_sql)
 
-    Regels:
-      - Bestaat monitor.db niet → return None
-      - Geen records voor deze source → return None
-      - temp:
-          * altijd 1 decimaal (float) of None
-      - hum:
-          * source == 'int' of 'ext' → integer (0 decimalen) of None
-          * overige sources (bv cpu/load) → 1 decimaal of None
+    Output:
+      {"ts": int, "temp": float|None, "hum": int|float|None} of None
     """
-    if not os.path.exists(MONITOR_DB_PATH):
-        return None
-
-    try:
-        conn = sqlite3.connect(MONITOR_DB_PATH)
-        conn.row_factory = sqlite3.Row
-
-        row = conn.execute(
-            """
-            SELECT ts, temp, hum
-            FROM measurements
-            WHERE source = ?
-            ORDER BY ts DESC
-            LIMIT 1
-            """,
-            (source,),
-        ).fetchone()
-
-        conn.close()
-
-        if row is None:
+    if SQLITE_MONITOR_ENABLED and os.path.exists(MONITOR_DB_PATH):
+        try:
+            conn = sqlite3.connect(MONITOR_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT ts, temp, hum
+                FROM measurements
+                WHERE source = ?
+                ORDER BY ts DESC
+                LIMIT 1
+                """,
+                (source,),
+            ).fetchone()
+            conn.close()
+            if row is None:
+                return None
+            temp_out = None if row["temp"] is None else round(float(row["temp"]), 1)
+            if row["hum"] is None:
+                hum_out = None
+            else:
+                hum_out = int(round(float(row["hum"]), 0)) if source in ("int", "ext") else round(float(row["hum"]), 1)
+            return {"ts": int(row["ts"]), "temp": temp_out, "hum": hum_out}
+        except Exception:
             return None
 
-        # --- temp ---
-        if row["temp"] is None:
-            temp_out = None
-        else:
-            temp_out = round(float(row["temp"]), 1)
-
-        # --- hum ---
-        if row["hum"] is None:
+    try:
+        q = (
+            "SELECT time, temp, hum "
+            "FROM measurements "
+            f"WHERE source = '{str(source).replace("'", "")}' "
+            "ORDER BY time DESC "
+            "LIMIT 1"
+        )
+        rows = _influxdb_query_sql(q)
+        if not rows:
+            return None
+        r = rows[0]
+        ts_unix = _parse_influx_time_to_unix_s(r.get("time"))
+        if ts_unix is None:
+            ts_unix = int(time.time())
+        temp = r.get("temp")
+        hum = r.get("hum")
+        temp_out = None if temp is None else round(float(temp), 1)
+        if hum is None:
             hum_out = None
         else:
-            if source in ("int", "ext"):
-                # DHT: humidity altijd 0 decimalen
-                hum_out = int(round(float(row["hum"]), 0))
-            else:
-                # cpu/load/etc
-                hum_out = round(float(row["hum"]), 1)
-
-        return {
-            "ts": row["ts"],
-            "temp": temp_out,
-            "hum": hum_out,
-        }
-
+            hum_out = int(round(float(hum), 0)) if source in ("int", "ext") else round(float(hum), 1)
+        return {"ts": int(ts_unix), "temp": temp_out, "hum": hum_out}
     except Exception:
         return None
 
@@ -966,6 +1233,21 @@ def fail2ban_status():
 app = Flask(__name__)
 app.secret_key = load_or_create_secret()
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# ---------------------------------------------------------
+# Runtime init hook (Gunicorn-safe)
+# ---------------------------------------------------------
+# Gunicorn importeert de module in een master en forkt daarna workers.
+# Threads gestart in de master overleven de fork niet.
+# Daarom initialiseren we lazy in de worker, bij het eerste request.
+@app.before_request
+def _pi3twe_runtime_init_once():
+    try:
+        if _MONITOR_DB_THREAD is None or not _MONITOR_DB_THREAD.is_alive():
+            init_for_gunicorn()
+    except Exception:
+        pass
+
 
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -1159,11 +1441,23 @@ def cooldown_left() -> int:
         return max(0, int(cooldown_seconds() - (time.time() - STATE["last_switch"])))
 
 
-def set_repeater(on: bool) -> None:
+def set_repeater(on: bool, *, actor: str = "", reason: str = "system", source: str = "system", msg: str = "") -> None:
     GPIO.output(RELAY_GPIO, GPIO.HIGH if on else GPIO.LOW)
     with _STATE_LOCK:
         STATE["repeater_on"] = bool(on)
         STATE["last_switch"] = time.time()
+        st_on = bool(STATE["repeater_on"])
+
+    # Influx logging (AAN/UIT + context)
+    influx_log_repeater_state_event(
+        state_on=st_on,
+        event="repeater_on" if st_on else "repeater_off",
+        reason=reason,
+        source=source,
+        actor=actor,
+        client_ip_str=(client_ip() if has_request_context() else "-"),
+        message=msg or ("manual" if reason == "api" else reason),
+    )
 
 
 def toggle_repeater(source: str) -> bool:
@@ -1177,7 +1471,13 @@ def toggle_repeater(source: str) -> bool:
     with _STATE_LOCK:
         new_state = not STATE["repeater_on"]
 
-    set_repeater(new_state)
+    set_repeater(
+        new_state,
+        actor="local_machine",
+        reason="button" if source.startswith("button") else "system",
+        source=source,
+        msg=f"toggle via {source}",
+    )
     audit_system("REPEATER_TOGGLE", f"source={source} state={'on' if new_state else 'off'}")
     return True
 
@@ -1816,63 +2116,6 @@ def api_admin_alarm_set():
     except Exception:
         abort(400, "Ongeldige trip/clear waarde.")
 
-
-# ======================================================
-# CALIBRATION API (admin only)
-# ======================================================
-@app.get("/api/admin/calibration")
-def api_admin_calibration_get():
-    admin_required()
-    try:
-        int_temp = float(setting_get("cal_int_temp_offset", "0.0"))
-        int_hum = float(setting_get("cal_int_hum_offset", "0.0"))
-        ext_temp = float(setting_get("cal_ext_temp_offset", "0.0"))
-        ext_hum = float(setting_get("cal_ext_hum_offset", "0.0"))
-    except Exception:
-        int_temp = int_hum = ext_temp = ext_hum = 0.0
-    
-    # DHT data komt uit database via dht_logger.py
-    it = read_monitor_latest(SRC_INT)
-    ex = read_monitor_latest(SRC_EXT)
-    
-    return jsonify({
-        "offsets": {"int_temp": int_temp, "int_hum": int_hum, "ext_temp": ext_temp, "ext_hum": ext_hum},
-        "current_values": {"int": it or {}, "ext": ex or {}}
-    })
-
-@app.post("/api/admin/calibration")
-def api_admin_calibration_set():
-    admin_required()
-    data = request.get_json(silent=True) or {}
-    try:
-        int_temp = float(data.get("int_temp", 0.0))
-        int_hum = float(data.get("int_hum", 0.0))
-        ext_temp = float(data.get("ext_temp", 0.0))
-        ext_hum = float(data.get("ext_hum", 0.0))
-    except Exception:
-        abort(400, "Ongeldige calibratie waarden.")
-    
-    if abs(int_temp) > 10 or abs(ext_temp) > 10:
-        abort(400, "Temp offset te groot (max ±10°C).")
-    if abs(int_hum) > 20 or abs(ext_hum) > 20:
-        abort(400, "Hum offset te groot (max ±20%).")
-    
-    setting_set("cal_int_temp_offset", str(int_temp))
-    setting_set("cal_int_hum_offset", str(int_hum))
-    setting_set("cal_ext_temp_offset", str(ext_temp))
-    setting_set("cal_ext_hum_offset", str(ext_hum))
-    audit("CALIBRATION_SET", current_user_id(), f"INT({int_temp:.1f}°C,{int_hum:.0f}%) EXT({ext_temp:.1f}°C,{ext_hum:.0f}%)")
-    return jsonify({"ok": True})
-
-@app.post("/api/admin/calibration/reset")
-def api_admin_calibration_reset():
-    admin_required()
-    setting_set("cal_int_temp_offset", "0.0")
-    setting_set("cal_int_hum_offset", "0.0")
-    setting_set("cal_ext_temp_offset", "0.0")
-    setting_set("cal_ext_hum_offset", "0.0")
-    audit("CALIBRATION_RESET", current_user_id(), "All offsets reset to 0")
-    return jsonify({"ok": True})
     if clear >= trip:
         abort(400, "clear_c moet lager zijn dan trip_c.")
 
@@ -1995,6 +2238,10 @@ def uplink_label_cached(wan_ip: str, min_interval_s: float = 5.0) -> str:
     
 @app.get("/api/state")
 def api_state():
+    return jsonify(_build_state())
+
+
+def _build_state() -> Dict[str, Any]:
     enabled = setting_get("alarm_enabled", "1") == "1"
     try:
         trip = float(setting_get("alarm_trip", str(DEFAULT_ALARM_TRIP_C)))
@@ -2009,7 +2256,6 @@ def api_state():
     lan = get_lan_ip()
     wan = get_wan_ip()
 
-    # NEW: uplink label + cpu load %
     uplink = uplink_label_cached(wan)
     cpu_load = cpu_load_percent_cached()
 
@@ -2017,12 +2263,10 @@ def api_state():
     it = read_monitor_latest(SRC_INT)
     ex = read_monitor_latest(SRC_EXT)
 
-    # NEW: attach cpu_load into cpu monitor dict (if dict)
     try:
         if cpu is None:
             cpu = {}
         if isinstance(cpu, dict):
-            # keep it small; percent as float (e.g. 18.3)
             cpu["load"] = cpu_load
     except Exception:
         pass
@@ -2032,29 +2276,34 @@ def api_state():
 
     up_s = read_uptime_seconds()
     up_txt = format_uptime(up_s)
-    
-    return jsonify({
+
+    return {
         "repeater": rep,
         "cooldown": cooldown_left(),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "uptime_s": up_s,
         "uptime": up_txt,
         "client_ip": client_ip(),
-
         "lan_ip": lan,
         "wan_ip": wan,
-        "wan_uplink": uplink,   # NEW
+        "wan_uplink": uplink,
         "band": band,
+        "monitor": {"cpu": cpu, "int": it, "ext": ex},
+        "alarm": {"enabled": enabled, "trip_c": trip, "clear_c": clear},
+    }
 
-        "monitor": {
-            "cpu": cpu,
-            "int": it,
-            "ext": ex,
-        },
 
-        "alarm": {"enabled": enabled, "trip_c": trip, "clear_c": clear}
-    })
-
+@app.get("/api/public/repeater-status")
+def api_public_repeater_status():
+    """
+    Publieke repeater status (read-only, veilig).
+    Wordt gebruikt door pi3twe.nl
+    """
+    try:
+        return jsonify(_build_state())
+    except Exception as e:
+        LOG.exception("public repeater-status failed")
+        return jsonify({"ok": False, "error": {"message": str(e)}}), 500
 
 @app.post("/api/repeater/on")
 def api_on():
@@ -2064,7 +2313,7 @@ def api_on():
             return jsonify({"ok": True})
     if in_cooldown():
         abort(429, "Cooldown actief")
-    set_repeater(True)
+    set_repeater(True, actor=_current_actor_username(), reason="api", source="api", msg="manual ON")
     audit("REPEATER_ON", session["uid"], "manual")
     return jsonify({"ok": True})
 
@@ -2077,7 +2326,7 @@ def api_off():
             return jsonify({"ok": True})
     if in_cooldown():
         abort(429, "Cooldown actief")
-    set_repeater(False)
+    set_repeater(False, actor=_current_actor_username(), reason="api", source="api", msg="manual OFF")
     audit("REPEATER_OFF", session["uid"], "manual")
     return jsonify({"ok": True})
 
@@ -2183,6 +2432,22 @@ def init_for_gunicorn() -> None:
         start_monitor_thread_once()
         start_monitor_db_logger_once()
 
+        # --- Repeater boot visibility in Influx (once per process) ---
+        global _REPEATER_BOOT_LOGGED
+        if not _REPEATER_BOOT_LOGGED:
+            _REPEATER_BOOT_LOGGED = True
+            with _STATE_LOCK:
+                st_on = bool(STATE.get("repeater_on", True))
+            influx_log_repeater_state_event(
+                state_on=st_on,
+                event="system_boot",
+                reason="boot",
+                source="gunicorn_import",
+                actor="local_machine",
+                client_ip_str="-",
+                message="boot/import completed",
+            )
+
         audit_system("MAIL_SELFTEST_START", "gunicorn_import")
 
         # Startup selftest mail (formatted; header image inline when present)
@@ -2211,6 +2476,7 @@ def main():
     db_init()
     ensure_superadmin_exists()
     start_monitor_thread_once()
+    start_monitor_db_logger_once()
     app.run(host="127.0.0.1", port=3001)
 
 

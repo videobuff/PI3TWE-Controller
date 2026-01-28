@@ -284,17 +284,86 @@ def read_cpu_temp_c() -> Optional[float]:
 # ---------------------
 # DHT11 logic (safe: missing => placeholders)
 # ---------------------
+_DHT_INT = None
+_DHT_EXT = None
+
+_DHT_CACHE_LOCK = threading.Lock()
+_DHT_CACHE = {
+    "t": 0.0,
+    "int": {"temp": "xx.x", "hum": "xx"},
+    "ext": {"temp": "xx.x", "hum": "xx"},
+}
+_DHT_MIN_INTERVAL_S = 2.0  # avoid hammering DHT11
 
 
+def _bcm_to_board_pin(bcm: int):
+    # board.Dxx is present for most BCM pins on Raspberry Pi
+    if board is None:
+        return None
+    attr = f"D{int(bcm)}"
+    return getattr(board, attr, None)
 
 
 def dht_init_once() -> None:
-    """DHT disabled - using dht_logger.py instead"""
-    pass
+    global _DHT_INT, _DHT_EXT
+    if adafruit_dht is None or board is None:
+        return
+    if _DHT_INT is None:
+        bp = _bcm_to_board_pin(DHT_INT_GPIO)
+        if bp is not None:
+            try:
+                _DHT_INT = adafruit_dht.DHT11(bp)
+            except Exception:
+                _DHT_INT = None
+    if _DHT_EXT is None:
+        bp = _bcm_to_board_pin(DHT_EXT_GPIO)
+        if bp is not None:
+            try:
+                _DHT_EXT = adafruit_dht.DHT11(bp)
+            except Exception:
+                _DHT_EXT = None
 
 
+def read_dht_safe(dht_device) -> Dict[str, Any]:
+    """
+    Returns always:
+      {"temp": float(1dp) or "xx.x", "hum": int(0dp) or "xx"}
+    """
+    try:
+        if dht_device is None:
+            raise RuntimeError("no device")
+        temp = dht_device.temperature
+        hum = dht_device.humidity
+        if temp is None or hum is None:
+            raise RuntimeError("no data")
+        return {
+            "temp": round(float(temp), 1),
+            "hum": int(round(float(hum), 0)),
+        }
+    except Exception:
+        return {"temp": "xx.x", "hum": "xx"}
 
 
+def _dht_to_db_values(v: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Convert cached DHT reading to DB numeric values (REAL/NULL).
+    hum is stored as REAL too; we store integer as float (Grafana ok) or NULL.
+    """
+    t = v.get("temp")
+    h = v.get("hum")
+    temp_f: Optional[float] = None
+    hum_f: Optional[float] = None
+    try:
+        if isinstance(t, (int, float)):
+            temp_f = float(t)
+    except Exception:
+        temp_f = None
+    try:
+        if isinstance(h, (int, float)):
+            hum_f = float(h)
+    except Exception:
+        hum_f = None
+    return temp_f, hum_f
 
 
 # ---------------------
@@ -499,11 +568,42 @@ def _read_load_averages():
     return None, None, None
 
 
+def read_dht_cached() -> Dict[str, Any]:
+    """
+    Read DHT sensors with caching to avoid hammering them.
+    Returns cached values if called too frequently.
+    """
+    global _DHT_CACHE
+    
+    with _DHT_CACHE_LOCK:
+        now = time.time()
+        
+        # Return cached if too recent
+        if (now - _DHT_CACHE["t"]) < _DHT_MIN_INTERVAL_S:
+            return {
+                "int": _DHT_CACHE["int"].copy(),
+                "ext": _DHT_CACHE["ext"].copy(),
+            }
+        
+        # Read fresh values
+        int_data = read_dht_safe(_DHT_INT)
+        ext_data = read_dht_safe(_DHT_EXT)
+        
+        # Update cache
+        _DHT_CACHE["t"] = now
+        _DHT_CACHE["int"] = int_data
+        _DHT_CACHE["ext"] = ext_data
+        
+        return {
+            "int": int_data.copy(),
+            "ext": ext_data.copy(),
+        }
 
 
 
-def _monitor_db_loop_DISABLED() -> None:
+def _monitor_db_loop() -> None:
     monitor_db_ensure_tables()
+    dht_init_once()
 
     while not _MONITOR_DB_STOP.is_set():
         try:
@@ -527,6 +627,18 @@ def _monitor_db_loop_DISABLED() -> None:
                     float(cpu_load_pct) if cpu_load_pct is not None else None,
                 )
 
+            # DHT (INT/EXT)
+            d = read_dht_cached()
+            int_temp, int_hum = _dht_to_db_values(d["int"])
+            ext_temp, ext_hum = _dht_to_db_values(d["ext"])
+
+            monitor_db_insert(ts, SRC_INT, int_temp, int_hum)
+            monitor_db_insert(ts, SRC_EXT, ext_temp, ext_hum)
+
+            if _PROM_OK:
+                prom_set_dht("int", d["int"])
+                prom_set_dht("ext", d["ext"])
+
             # Load averages as separate sources
             l1, l5, l15 = _read_load_averages()
             if l1 is not None:
@@ -548,7 +660,7 @@ def _monitor_db_loop_DISABLED() -> None:
         _MONITOR_DB_STOP.wait(MONITOR_LOG_INTERVAL_S)
 
 
-def start_monitor_db_logger_once_DISABLED() -> None:
+def start_monitor_db_logger_once() -> None:
     global _MONITOR_DB_THREAD
     if _MONITOR_DB_THREAD is not None and _MONITOR_DB_THREAD.is_alive():
         return
@@ -1831,13 +1943,10 @@ def api_admin_calibration_get():
     except Exception:
         int_temp = int_hum = ext_temp = ext_hum = 0.0
     
-    # DHT data komt uit database via dht_logger.py
-    it = read_monitor_latest(SRC_INT)
-    ex = read_monitor_latest(SRC_EXT)
-    
+    d = read_dht_cached()
     return jsonify({
         "offsets": {"int_temp": int_temp, "int_hum": int_hum, "ext_temp": ext_temp, "ext_hum": ext_hum},
-        "current_values": {"int": it or {}, "ext": ex or {}}
+        "current_values": {"int": d.get("int", {}), "ext": d.get("ext", {})}
     })
 
 @app.post("/api/admin/calibration")

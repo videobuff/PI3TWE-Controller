@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
 # File        : /srv/pi3twe/app/tft/tft_app_fb.py
-# Generated   : 2026-01-25 12:45 (Europe/Amsterdam)
+# Generated   : 2026-01-27 (Europe/Amsterdam)
 # Description :
 #   PI3TWE TFT UI – framebuffer only (RGB565), NO touch actions.
 #

@@ -1,10 +1,11 @@
 <!--
   Bestandsnaam : /var/www/pi3twe/index.html
-  Gegenereerd  : 2026-01-15 (Europe/Amsterdam)
+  Gegenereerd  : 2026-01-27 13:30 (Europe/Amsterdam)
   Beschrijving : PI3TWE Controller UI (Bootstrap 5, dark mode, responsive)
                  - Info / Repeater / Sensors + Log
                  - Login/Logout + 2FA setup/enable + Wachtwoord wijzigen
                  - Admin: users list/create/deactivate/activate + SUPERADMIN: hard delete + Alarm settings
+                 - Admin: Sensor kalibratie (temp/hum offsets voor INT/EXT)
                  - Fail2ban bans in Info card (LAN/WAN + Bans)
                  - Repeater status badge: full-width (same width as button), text = ON AIR / STAND BY
                  - Repeater card: network label (WLAN/ETH/HAMNET) + uptime under the button
@@ -28,6 +29,9 @@
   - POST /api/admin/users/<id>/purge
   - GET  /api/admin/alarm
   - POST /api/admin/alarm
+  - GET  /api/admin/calibration
+  - POST /api/admin/calibration
+  - POST /api/admin/calibration/reset
 
   Verwacht (optioneel) in /api/state:
   - wan_uplink: string (bv "wlan0", "eth0", "end0", "enx...")
@@ -43,9 +47,7 @@
 
     <link
       href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
-      rel="stylesheet"
-      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
-      crossorigin="anonymous" />
+      rel="stylesheet" />
 
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" />
 
@@ -373,7 +375,12 @@
             </div>
             <div class="mb-2">
               <label class="form-label small muted mb-1">Wachtwoord</label>
-              <input id="loginPw" type="password" class="form-control" autocomplete="current-password" />
+              <div class="input-group">
+                              <input id="loginPw" type="password" class="form-control" autocomplete="current-password" />
+                              <button class="btn btn-outline-light" type="button" id="btnPwToggle_login" aria-label="Toon/verberg wachtwoord">
+                                <i class="bi bi-eye" id="icoPwToggle_login"></i>
+                              </button>
+                            </div>
             </div>
             <div class="mb-2">
               <label class="form-label small muted mb-1">OTP (alleen als 2FA aan staat)</label>
@@ -436,11 +443,21 @@
           <div class="modal-body">
             <div class="mb-2">
               <label class="form-label small muted mb-1">Oud wachtwoord</label>
-              <input id="pwOld" type="password" class="form-control" autocomplete="current-password" />
+              <div class="input-group">
+                              <input id="pwOld" type="password" class="form-control" autocomplete="current-password" />
+                              <button class="btn btn-outline-light" type="button" id="btnPwToggle_old" aria-label="Toon/verberg wachtwoord">
+                                <i class="bi bi-eye" id="icoPwToggle_old"></i>
+                              </button>
+                            </div>
             </div>
             <div class="mb-2">
               <label class="form-label small muted mb-1">Nieuw wachtwoord</label>
-              <input id="pwNew" type="password" class="form-control" autocomplete="new-password" />
+              <div class="input-group">
+                              <input id="pwNew" type="password" class="form-control" autocomplete="new-password" />
+                              <button class="btn btn-outline-light" type="button" id="btnPwToggle_new" aria-label="Toon/verberg wachtwoord">
+                                <i class="bi bi-eye" id="icoPwToggle_new"></i>
+                              </button>
+                            </div>
             </div>
             <div class="d-grid">
               <button id="btnPwChange" class="btn btn-outline-light">Opslaan</button>
@@ -505,6 +522,57 @@
                   <div id="alarmMsg" class="small muted mt-2"></div>
                 </div>
               </div>
+
+              <!-- Sensor kalibratie -->
+              <div class="col-12 col-lg-7">
+                <div class="card p-3">
+                  <div class="fw-bold mb-2">Sensor kalibratie</div>
+                  <div class="small muted mb-2">Offset wordt opgeteld bij de ruwe sensorwaarde</div>
+                  <div class="row g-2">
+                    <div class="col-6">
+                      <div class="small fw-bold mb-1">INT sensor</div>
+                      <div class="row g-1">
+                        <div class="col-6">
+                          <label class="form-label small muted mb-0">Temp (°C)</label>
+                          <input class="form-control form-control-sm" type="number" step="0.1" id="calIntTemp" />
+                        </div>
+                        <div class="col-6">
+                          <label class="form-label small muted mb-0">Hum (%)</label>
+                          <input class="form-control form-control-sm" type="number" step="1" id="calIntHum" />
+                        </div>
+                      </div>
+                      <div class="small muted mt-1" id="calIntCurrent">--</div>
+                    </div>
+                    <div class="col-6">
+                      <div class="small fw-bold mb-1">EXT sensor</div>
+                      <div class="row g-1">
+                        <div class="col-6">
+                          <label class="form-label small muted mb-0">Temp (°C)</label>
+                          <input class="form-control form-control-sm" type="number" step="0.1" id="calExtTemp" />
+                        </div>
+                        <div class="col-6">
+                          <label class="form-label small muted mb-0">Hum (%)</label>
+                          <input class="form-control form-control-sm" type="number" step="1" id="calExtHum" />
+                        </div>
+                      </div>
+                      <div class="small muted mt-1" id="calExtCurrent">--</div>
+                    </div>
+                  </div>
+                  <div class="row g-2 mt-2">
+                    <div class="col-6">
+                      <button id="btnSaveCal" class="btn btn-outline-light w-100">
+                        <i class="bi bi-save2 me-1"></i>Opslaan
+                      </button>
+                    </div>
+                    <div class="col-6">
+                      <button id="btnResetCal" class="btn btn-outline-secondary w-100">
+                        <i class="bi bi-arrow-counterclockwise me-1"></i>Reset
+                      </button>
+                    </div>
+                  </div>
+                  <div id="calMsg" class="small muted mt-2"></div>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -551,9 +619,7 @@
     </div>
 
     <script
-      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
-      integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"
-      crossorigin="anonymous"></script>
+      src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
     <script>
       function escapeHtml(s) {
@@ -563,6 +629,30 @@
           .replaceAll(">", "&gt;")
           .replaceAll('"', "&quot;")
           .replaceAll("'", "&#039;");
+      }
+
+
+      function attachPwToggle(inputId, btnId, iconId) {
+        const inp = document.getElementById(inputId);
+        const btn = document.getElementById(btnId);
+        const ico = document.getElementById(iconId);
+        if (!inp || !btn || !ico) return;
+
+        const setState = (show) => {
+          inp.type = show ? "text" : "password";
+          ico.classList.toggle("bi-eye", !show);
+          ico.classList.toggle("bi-eye-slash", show);
+          btn.setAttribute("aria-pressed", show ? "true" : "false");
+        };
+
+        // default = hidden
+        setState(false);
+
+        btn.addEventListener("click", () => {
+          const show = inp.type === "password";
+          setState(show);
+          inp.focus();
+        });
       }
 
       async function fetchJson(url, opts = {}) {
@@ -654,6 +744,8 @@
 
       const API_ADMIN_USERS = "/api/admin/users";
       const API_ADMIN_ALARM = "/api/admin/alarm";
+      const API_ADMIN_CALIBRATION = "/api/admin/calibration";
+      const API_ADMIN_CALIBRATION_RESET = "/api/admin/calibration/reset";
 
       const POLL_STATE_MS = 1200;
       const POLL_LOG_MS = 3000;
@@ -707,6 +799,17 @@
       const alarmClear = document.getElementById("alarmClear");
       const btnSaveAlarm = document.getElementById("btnSaveAlarm");
       const alarmMsg = document.getElementById("alarmMsg");
+
+      // Calibration elements
+      const calIntTemp = document.getElementById("calIntTemp");
+      const calIntHum = document.getElementById("calIntHum");
+      const calExtTemp = document.getElementById("calExtTemp");
+      const calExtHum = document.getElementById("calExtHum");
+      const calIntCurrent = document.getElementById("calIntCurrent");
+      const calExtCurrent = document.getElementById("calExtCurrent");
+      const btnSaveCal = document.getElementById("btnSaveCal");
+      const btnResetCal = document.getElementById("btnResetCal");
+      const calMsg = document.getElementById("calMsg");
 
       const nuUsername = document.getElementById("nuUsername");
       const nuEmail = document.getElementById("nuEmail");
@@ -1098,6 +1201,29 @@
         }
       }
 
+      async function loadCalibration() {
+        calMsg.textContent = "";
+        try {
+          const c = await fetchJson(API_ADMIN_CALIBRATION);
+          calIntTemp.value = c.offsets.int_temp || 0;
+          calIntHum.value = c.offsets.int_hum || 0;
+          calExtTemp.value = c.offsets.ext_temp || 0;
+          calExtHum.value = c.offsets.ext_hum || 0;
+          
+          // Show current calibrated values
+          const intVal = c.current_values.int;
+          const extVal = c.current_values.ext;
+          calIntCurrent.textContent = intVal && intVal.temp !== "xx.x" 
+            ? `Huidig: ${intVal.temp}°C / ${intVal.hum}%` 
+            : "Sensor niet beschikbaar";
+          calExtCurrent.textContent = extVal && extVal.temp !== "xx.x" 
+            ? `Huidig: ${extVal.temp}°C / ${extVal.hum}%` 
+            : "Sensor niet beschikbaar";
+        } catch (e) {
+          calMsg.textContent = e.message;
+        }
+      }
+
       btnLoginOpen.addEventListener("click", () => {
         loginMsg.textContent = "";
         loginIdent.value = "";
@@ -1197,9 +1323,11 @@
       btnAdminOpen.addEventListener("click", async () => {
         usersMsg.textContent = "";
         alarmMsg.textContent = "";
+        calMsg.textContent = "";
         adminModal.show();
         await loadUsers();
         await loadAlarm();
+        await loadCalibration();
       });
 
       btnSaveAlarm.addEventListener("click", async () => {
@@ -1217,6 +1345,38 @@
           alarmMsg.textContent = "Opgeslagen.";
         } catch (e) {
           alarmMsg.textContent = e.message;
+        }
+      });
+
+      btnSaveCal.addEventListener("click", async () => {
+        calMsg.textContent = "Opslaan...";
+        try {
+          await fetchJson(API_ADMIN_CALIBRATION, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              int_temp: parseFloat(calIntTemp.value) || 0,
+              int_hum: parseFloat(calIntHum.value) || 0,
+              ext_temp: parseFloat(calExtTemp.value) || 0,
+              ext_hum: parseFloat(calExtHum.value) || 0
+            })
+          });
+          calMsg.textContent = "Opgeslagen.";
+          await loadCalibration(); // Refresh to show new values
+        } catch (e) {
+          calMsg.textContent = e.message;
+        }
+      });
+
+      btnResetCal.addEventListener("click", async () => {
+        if (!confirm("Weet je zeker dat je alle kalibratie offsets wilt resetten naar 0?")) return;
+        calMsg.textContent = "Resetten...";
+        try {
+          await fetchJson(API_ADMIN_CALIBRATION_RESET, { method: "POST" });
+          calMsg.textContent = "Reset naar 0.";
+          await loadCalibration();
+        } catch (e) {
+          calMsg.textContent = e.message;
         }
       });
 
@@ -1278,6 +1438,10 @@
       });
 
       (async () => {
+        attachPwToggle('loginPw','btnPwToggle_login','icoPwToggle_login');
+        attachPwToggle('pwOld','btnPwToggle_old','icoPwToggle_old');
+        attachPwToggle('pwNew','btnPwToggle_new','icoPwToggle_new');
+
         elFooterHost.textContent = location.host;
         await refreshMe();
         await pollState();
