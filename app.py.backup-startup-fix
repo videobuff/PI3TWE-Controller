@@ -2181,7 +2181,7 @@ def init_for_gunicorn() -> None:
         db_init()
         ensure_superadmin_exists()
         start_monitor_thread_once()
-# DISABLED - now handled by dht-logger.service:         start_monitor_db_logger_once()
+        start_monitor_db_logger_once()
 
         audit_system("MAIL_SELFTEST_START", "gunicorn_import")
 
