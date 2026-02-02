@@ -217,7 +217,7 @@
             <button id="btnAdminOpen" class="btn btn-outline-light btn-sm" style="display: none">
               <i class="bi bi-gear me-1"></i>Admin
             </button>
-                <button id="btnMonitor" class="btn btn-outline-light btn-sm" style="display: none" onclick="window.open('/grafana/d/pi3twe-monitor/pi3twe-monitor?kiosk&refresh=30s&theme=dark&_=' + Date.now(), '_blank');">
+                <button id="btnMonitor" class="btn btn-outline-light btn-sm" style="display: none" onclick="window.open('https://repeater.pi3twe.nl/grafana/d/pi3twe-monitor/pi3twe-monitor?kiosk&refresh=30s&theme=dark&_=' + Date.now(), '_blank');">
               <i class="bi bi-graph-up me-1"></i>Monitor
             </button>
           </div>
