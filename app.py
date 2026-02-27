@@ -634,10 +634,10 @@ def send_mail(to_addr: str, subject: str, body_text: str, body_html: str) -> Non
     Failures are logged in audit_log but do not hard-fail the API call.
     """
     if not os.path.exists(MSMTP_BIN):
-        audit("MAIL_FAIL", current_user_id(), f"msmtp binary ontbreekt: {MSMTP_BIN}")
+        audit_system("MAIL_FAIL", f"msmtp binary ontbreekt: {MSMTP_BIN}")
         return
     if not os.path.exists(MSMTP_CONF):
-        audit("MAIL_FAIL", current_user_id(), f"msmtprc ontbreekt: {MSMTP_CONF}")
+        audit_system("MAIL_FAIL", f"msmtprc ontbreekt: {MSMTP_CONF}")
         return
 
     msg = _build_mime_message(
@@ -659,9 +659,9 @@ def send_mail(to_addr: str, subject: str, body_text: str, body_html: str) -> Non
             check=False,
         )
         if p.returncode != 0:
-            audit("MAIL_FAIL", current_user_id(), (p.stderr.decode("utf-8", errors="replace") or "")[:500])
+            audit_system("MAIL_FAIL", (p.stderr.decode("utf-8", errors="replace") or "")[:500])
     except Exception as e:
-        audit("MAIL_FAIL", current_user_id(), f"{type(e).__name__}: {e}")
+        audit_system("MAIL_FAIL", f"{type(e).__name__}: {e}")
 
 
 def _status_reason_from_event(event: str, details: str) -> str:
@@ -2054,6 +2054,17 @@ def api_state():
 
         "alarm": {"enabled": enabled, "trip_c": trip, "clear_c": clear}
     })
+
+
+@app.get("/api/public/status")
+def api_public_status():
+    """Public endpoint met CORS voor externe websites"""
+    with _STATE_LOCK:
+        rep = bool(STATE["repeater_on"])
+    
+    response = jsonify({"repeater": rep})
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 
 @app.post("/api/repeater/on")

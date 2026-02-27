@@ -819,6 +819,7 @@
       const nuMsg = document.getElementById("nuMsg");
 
       const loginModal = new bootstrap.Modal(document.getElementById("loginModal"));
+      document.getElementById("loginModal").addEventListener("keydown", e => { if (e.key === "Enter") document.getElementById("btnDoLogin").click(); });
       const loginIdent = document.getElementById("loginIdent");
       const loginPw = document.getElementById("loginPw");
       const loginOtp = document.getElementById("loginOtp");
@@ -951,9 +952,14 @@
         if (jails && typeof jails === "object") {
           const entries = Object.entries(jails);
           if (entries.length) {
-            elBanDetail.innerHTML = entries.map(([k,v]) =>
-              `<div class="ban-row"><span class="ban-name">${escapeHtml(k)}</span><span class="ban-count">${escapeHtml(v)}</span></div>`
-            ).join("");
+              
+              
+            elBanDetail.innerHTML = entries.map(([k,v]) => {
+            const shortName = k.replace(/^nginx-/, '');
+            return `<div class="ban-row"><span class="ban-name">${escapeHtml(shortName)}</span><span class="ban-count">${escapeHtml(v)}</span></div>`;
+            }).join("");
+            
+            
             elBanDetail.style.display = "";
           } else {
             elBanDetail.style.display = "none";
@@ -974,6 +980,7 @@
       }
 
       async function pollFail2ban() {
+        if (!me.logged_in) return;
         try {
           const d = await fetchJson(API_FAIL2BAN);
           const total = (typeof d.total === "number" && isFinite(d.total)) ? d.total : null;
@@ -1230,6 +1237,10 @@
         loginPw.value = "";
         loginOtp.value = "";
         loginModal.show();
+      });
+
+      // Enter-toets in login velden
+      [loginIdent, loginPw, loginOtp].forEach(el => {
       });
 
       btnDoLogin.addEventListener("click", async () => {
